@@ -1,0 +1,850 @@
+%%writefile app_salto.py
+import os
+import tempfile
+import subprocess
+import cv2
+import numpy as np
+import matplotlib
+import matplotlib.pyplot as plt
+import mediapipe as mp
+import streamlit as st
+from PIL import Image, ImageDraw, ImageFont
+
+# =====================================================================
+# CONFIGURACIÓN DE PÁGINA
+# =====================================================================
+st.set_page_config(page_title="JumpLab AI - Análisis Biomecánico", page_icon="🏃‍♂️", layout="wide")
+
+st.title("🏃‍♂️ JumpLab AI — Análisis Biomecánico de Salto")
+st.markdown("Motor biomecánico de precisión con anclaje anatómico definitivo y corrección estricta de métricas.")
+
+if "datos_salto" not in st.session_state:
+    st.session_state.datos_salto = None
+if "video_id" not in st.session_state:
+    st.session_state.video_id = None
+
+# =====================================================================
+# CONSTANTES Y FUNCIONES AUXILIARES
+# =====================================================================
+NARIZ = 0
+HOMBRO_I, HOMBRO_D = 11, 12
+CADERA_I, CADERA_D = 23, 24
+RODILLA_I, RODILLA_D = 25, 26
+TOBILLO_I, TOBILLO_D = 27, 28
+TALON_I, TALON_D = 29, 30
+PUNTA_I, PUNTA_D = 31, 32
+
+PIES = [27, 28, 29, 30, 31, 32]
+CUERPO = [(11, 13), (13, 15), (12, 14), (14, 16), (11, 12), (11, 23), (12, 24), (23, 24)]
+AZUL, NARANJA, VERDE = (255, 110, 20), (0, 150, 255), (60, 230, 60)
+
+MODELO_PATH = "pose_landmarker.task"
+
+@st.cache_resource
+def asegurar_modelo():
+    if not os.path.exists(MODELO_PATH):
+        url = "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_heavy/float16/1/pose_landmarker_heavy.task"
+        subprocess.run(["wget", "-q", url, "-O", MODELO_PATH], check=True)
+    return MODELO_PATH
+
+def angulo(a, b, c):
+    ba, bc = a - b, c - b
+    cos = np.dot(ba, bc) / (np.linalg.norm(ba) * np.linalg.norm(bc) + 1e-6)
+    return float(np.degrees(np.arccos(np.clip(cos, -1, 1))))
+
+def suavizar_serie(valores, ventana=3):
+    """Promedio móvil. Reduce el ruido de MediaPipe sin correr la serie en el tiempo."""
+    v = np.asarray(valores, dtype=float)
+    if len(v) < ventana:
+        return v
+    mitad = ventana // 2
+    v_ext = np.pad(v, mitad, mode="edge")          # repite los bordes para no perder datos
+    return np.convolve(v_ext, np.ones(ventana) / ventana, mode="valid")
+
+def suavizar_savgol5(valores):
+    """Suavizado de 5 puntos (Savitzky-Golay, grado 2).
+    Reduce el ruido pero conserva mejor los valles que un promedio simple."""
+    v = np.asarray(valores, dtype=float)
+    if len(v) < 5:
+        return v
+    pesos = np.array([-3, 12, 17, 12, -3]) / 35.0
+    v_ext = np.pad(v, 2, mode="edge")
+    return np.convolve(v_ext, pesos, mode="valid")
+
+def flexion_maxima_rodilla(pts, frame_apoyo, frame_despegue, cad, rod, tob):
+    frames = [f for f in range(frame_apoyo, frame_despegue + 1) if f in pts]
+    if not frames:
+        return 0.0, frame_apoyo, [], np.array([]), np.array([])
+    crudo = np.array([angulo(pts[f][cad], pts[f][rod], pts[f][tob]) for f in frames])
+    suave = suavizar_savgol5(crudo)
+    i_min = int(np.argmin(suave))
+    return float(suave[i_min]), frames[i_min], frames, crudo, suave
+
+def inclinacion(desde, hasta, sentido, referencia="arriba"):
+    dx = (hasta[0] - desde[0]) * sentido
+    dy = hasta[1] - desde[1]
+    if referencia == "arriba":
+        dy = -dy
+    return float(np.degrees(np.arctan2(dx, dy)))
+
+def quitar_picos(pts_dict, ini, fin, umbral):
+    pts = {k: v.copy() for k, v in pts_dict.items()}
+    picos_corregidos = 0
+    for largo in (1, 2):
+        for k in range(ini, fin - largo + 2):
+            antes, despues = k - 1, k + largo
+            if any(j not in pts for j in range(antes, despues + 1)):
+                continue
+            for i in range(33):
+                a, b = pts[antes][i], pts[despues][i]
+                esperado = [a + (b - a) * (j + 1) / (largo + 1) for j in range(largo)]
+                desvio = min(np.linalg.norm(pts[k + j][i] - esperado[j]) for j in range(largo))
+                if desvio > max(umbral, 2.5 * np.linalg.norm(b - a)):
+                    picos_corregidos += 1
+                    for j in range(largo):
+                        pts[k + j][i] = esperado[j]
+    return pts, picos_corregidos
+
+def mascara_sin_atleta(forma, p, margen=0.3):
+    mascara = np.full(forma, 255, np.uint8)
+    x0, y0 = p.min(axis=0)
+    x1, y1 = p.max(axis=0)
+    m = margen * max(x1 - x0, y1 - y0)
+    cv2.rectangle(mascara, (int(x0 - m), int(y0 - m)), (int(x1 + m), int(y1 + m)), 0, -1)
+    return mascara
+
+def mov_fondo(g0, g1, mascara):
+    pts = cv2.goodFeaturesToTrack(g0, maxCorners=500, qualityLevel=0.01, minDistance=10, mask=mascara)
+    if pts is None:
+        return None
+    nuevos, ok, _ = cv2.calcOpticalFlowPyrLK(g0, g1, pts, None, winSize=(31, 31), maxLevel=4)
+    d = (nuevos - pts).reshape(-1, 2)[ok.ravel() == 1]
+    if len(d) < 10:
+        return None
+    mediana = np.median(d, axis=0)
+    buenos = d[np.linalg.norm(d - mediana, axis=1) < 2]
+    if len(buenos) < 10:
+        return None
+    return buenos.mean(axis=0)
+
+def cargar_fuente(tam):
+    rutas = [os.path.join(matplotlib.get_data_path(), "fonts", "ttf", "DejaVuSans-Bold.ttf"),
+             "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"]
+    for ruta in rutas:
+        try:
+            return ImageFont.truetype(ruta, tam)
+        except Exception:
+            pass
+    return ImageFont.load_default()
+
+def medir(d, texto, fuente):
+    izq, arr, der, aba = d.textbbox((0, 0), texto, font=fuente)
+    p = int(getattr(fuente, "size", 14) * 0.3)
+    return der - izq + 2 * p, aba - arr + 2 * p, p, izq, arr
+
+def pastilla(d, x, y, texto, fuente):
+    w, h, p, izq, arr = medir(d, texto, fuente)
+    d.rounded_rectangle([x, y, x + w, y + h], radius=p, fill=(20, 20, 20, 175))
+    d.text((x + p - izq, y + p - arr), texto, font=fuente, fill=(255, 255, 255, 255))
+
+def etiquetas_apiladas_fijas(d, items, fuente, ancho, sentido):
+    medidas = [medir(d, texto, fuente) for _, texto in items]
+    p_tronco, p_cadera, p_rodilla = items[0][0], items[1][0], items[2][0]
+    h_tr, h_ca, h_ro = medidas[0][1], medidas[1][1], medidas[2][1]
+
+    y_tronco = p_tronco[1] - h_tr / 2
+    y_cadera = max(p_cadera[1] - h_ca / 2, y_tronco + h_tr + 10)
+    y_rodilla = max(p_rodilla[1] - h_ro / 2, y_cadera + h_ca + 10)
+    ys = [y_tronco, y_cadera, y_rodilla]
+
+    posiciones = []
+    for i, (punto, texto) in enumerate(items):
+        w, h = medidas[i][0], medidas[i][1]
+        x = punto[0] - ancho * 0.05 - w if sentido == 1 else punto[0] + ancho * 0.05
+        x = min(max(x, 10), ancho - w - 10)
+        posiciones.append((x, ys[i], w, h))
+
+    for (punto, _), (x, y, w, h) in zip(items, posiciones):
+        borde = x + w if sentido == 1 else x
+        d.line([(borde, y + h / 2), (punto[0], punto[1])], fill=(255, 255, 255, 210), width=max(2, ancho // 400))
+    for (_, texto), (x, y, w, h) in zip(items, posiciones):
+        pastilla(d, int(x), int(y), texto, fuente)
+
+def obtener_miniatura_frame(ruta_video, num_frame, pts_dict, pierna_batida):
+    cap = cv2.VideoCapture(ruta_video)
+    cap.set(cv2.CAP_PROP_POS_FRAMES, num_frame)
+    ok, img = cap.read()
+    cap.release()
+    if not ok:
+        return None
+    if pts_dict and num_frame in pts_dict:
+        p = pts_dict[num_frame]
+        grosor = max(3, img.shape[1] // 180)
+        p_ap = [(24, 26), (26, 28), (28, 30), (30, 32), (28, 32)] if pierna_batida == "Derecha" else [(23, 25), (25, 27), (27, 29), (29, 31), (27, 31)]
+        p_li = [(23, 25), (25, 27), (27, 29), (29, 31), (27, 31)] if pierna_batida == "Derecha" else [(24, 26), (26, 28), (28, 30), (30, 32), (28, 32)]
+        for conexiones, color in ((CUERPO, VERDE), (p_li, NARANJA), (p_ap, AZUL)):
+            for a, b in conexiones:
+                cv2.line(img, tuple(p[a].astype(int)), tuple(p[b].astype(int)), color, grosor, cv2.LINE_AA)
+    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    h, w = img_rgb.shape[:2]
+    nuevo_w = 340
+    nuevo_h = int(h * (nuevo_w / w))
+    return cv2.resize(img_rgb, (nuevo_w, nuevo_h))
+
+# =====================================================================
+# DETECCIÓN DE FASES Y PIERNA DE BATIDA (FORZANDO DERECHA POR DEFECTO)
+# =====================================================================
+def detectar_fases_y_pierna_auto(puntos, camara_raw, fps):
+    frames = sorted(set(puntos.keys()) & set(camara_raw.keys()))
+    if len(frames) < 15:
+        f_mid = frames[len(frames) // 2] if frames else 10
+        return f_mid, f_mid + 6, f_mid + 25, "Derecha"
+
+    # 1) Pie más bajo de cada frame (corregido por la cámara) y su posición horizontal
+    def pie_bajo(f):
+        p = puntos[f]
+        y_d = max(p[TOBILLO_D][1], p[TALON_D][1], p[PUNTA_D][1])
+        y_i = max(p[TOBILLO_I][1], p[TALON_I][1], p[PUNTA_I][1])
+        return max(y_d, y_i) - camara_raw[f][1]
+
+    def x_pie_bajo(f):
+        p = puntos[f]
+        lado = TOBILLO_D if p[TOBILLO_D][1] >= p[TOBILLO_I][1] else TOBILLO_I
+        return p[lado][0] - camara_raw[f][0]
+
+    # Serie continua: si a la IA le faltó algún frame, se rellena por interpolación
+    # (solo dentro de esta función; el resto de la app no se modifica)
+    todos = np.arange(frames[0], frames[-1] + 1)
+    y_crudo = np.interp(todos, frames, [pie_bajo(f) for f in frames])
+    x_pie = np.interp(todos, frames, [x_pie_bajo(f) for f in frames])
+    y_pie = suavizar_serie(y_crudo, 3)
+    n = len(todos)
+
+    # 2) Tolerancias proporcionales al tamaño del atleta en pantalla (no en píxeles fijos)
+    altura_px = float(np.median([pie_bajo(f) - (puntos[f][NARIZ][1] - camara_raw[f][1]) for f in frames]))
+    tol = 0.03 * altura_px             # "pie en el suelo" (~4 cm)
+    tol_despegue = 0.06 * altura_px    # "pie claramente despegado" (~8 cm)
+    v_llegada = 0.02 * altura_px       # velocidad (por frame) con que el pie aún "está llegando"
+
+    # 3) Primera pasada: el vuelo del salto = tramo MÁS LARGO sin contacto con el suelo
+    y_suelo = float(np.percentile(y_pie, 90))
+    en_suelo = y_pie >= (y_suelo - tol)
+    for i in range(1, n - 1):                      # quitar "parpadeos" de 1 frame
+        if en_suelo[i - 1] == en_suelo[i + 1] and en_suelo[i] != en_suelo[i - 1]:
+            en_suelo[i] = en_suelo[i - 1]
+
+    mejor_ini, mejor_largo = None, 0
+    i = 0
+    while i < n:
+        if not en_suelo[i]:
+            j = i
+            while j < n and not en_suelo[j]:
+                j += 1
+            if j - i > mejor_largo:
+                mejor_ini, mejor_largo = i, j - i
+            i = j
+        else:
+            i += 1
+
+    if mejor_ini is None or mejor_largo < int(0.2 * fps):      # vuelo menor a 0.2 s: no es un salto
+        f_mid = int(todos[n // 2])
+        return f_mid, f_mid + 6, f_mid + 25, "Derecha"
+
+    i_despegue = max(0, mejor_ini - 1)                 # último contacto (aproximado)
+    i_fin_vuelo = min(n - 1, mejor_ini + mejor_largo)  # primer contacto con el suelo (aproximado)
+
+    i_apoyo = i_despegue                               # inicio del bloque de contacto (aproximado)
+    x_ref = x_pie[i_despegue]
+    while i_apoyo > 0 and en_suelo[i_apoyo - 1] and abs(x_pie[i_apoyo - 1] - x_ref) <= 0.25 * altura_px:
+        i_apoyo -= 1
+
+    # 4) Afinar apoyo y despegue con el suelo LOCAL de la batida y los datos sin suavizar
+    #    (el suavizado "reparte" los cambios bruscos y corre los bordes 1-2 frames)
+    ini_nuc, fin_nuc = i_apoyo + 2, i_despegue - 2
+    if fin_nuc < ini_nuc:
+        ini_nuc, fin_nuc = i_apoyo, i_despegue
+    y_local = float(np.median(y_crudo[ini_nuc:fin_nuc + 1]))
+    x_batida = float(np.median(x_pie[ini_nuc:fin_nuc + 1]))
+
+    # despegue = primer frame en que el pie queda claramente levantado (2 frames seguidos,
+    # para que un solo frame con ruido no lo adelante)
+    k = fin_nuc
+    while k < n - 2 and not ((y_local - y_crudo[k]) > tol_despegue and (y_local - y_crudo[k + 1]) > tol_despegue):
+        k += 1
+    i_despegue = k
+
+    # apoyo = el pie ya está en el suelo local, en el mismo lugar, y deja de bajar
+    k = ini_nuc
+    while k > 0 and (y_local - y_crudo[k - 1]) <= tol and abs(x_pie[k - 1] - x_batida) <= 0.25 * altura_px:
+        k -= 1
+    while k < ini_nuc and (y_crudo[k] - y_crudo[k - 1]) > v_llegada:   # el pie todavía está llegando
+        k += 1
+    i_apoyo = k
+
+    # 5) Aterrizaje: el pie llega al punto más bajo que alcanza después del vuelo.
+    #    No se compara con el suelo de la carrera, porque la arena puede quedar a otra altura
+    #    en la imagen (en tu video quedaba ~13 cm más arriba).
+    a = min(i_despegue, n - 1)
+    b = max(i_fin_vuelo, a + 1)
+    i_pico = a + int(np.argmin(y_pie[a:b + 1]))                                # pie en su punto más alto
+    fin_ventana = min(n, i_pico + int(0.75 * fps))
+    resto = y_pie[i_pico:fin_ventana]
+    y_bajo = float(np.max(resto))                                              # punto más bajo tras el vuelo
+    i_aterrizaje = i_pico + int(np.argmax(resto >= y_bajo - tol))
+    i_aterrizaje = min(i_aterrizaje, max(i_fin_vuelo, i_pico + 1))
+    # Control: un pie que aterriza tiene que estar mucho más abajo que en lo más alto del vuelo.
+    # Si no, el seguimiento terminó antes del aterrizaje: se devuelve el último frame disponible.
+    altura_pico = y_local - y_pie[i_pico]
+    altura_aterr = y_local - y_pie[min(i_aterrizaje, n - 1)]
+    if altura_pico <= 0 or altura_aterr > 0.45 * altura_pico:
+        i_aterrizaje = n - 1
+
+    # orden lógico: apoyo < despegue < aterrizaje
+    i_despegue = max(i_despegue, i_apoyo + 1)
+    i_aterrizaje = max(i_aterrizaje, i_despegue + 1)
+
+    pierna_auto = "Derecha"   # sigue fija; se puede mejorar después
+    return int(todos[i_apoyo]), int(todos[i_despegue]), int(todos[i_aterrizaje]), pierna_auto
+
+# =====================================================================
+# FUNCIONES DE UI Y SEMÁFOROS
+# =====================================================================
+def calcular_puntaje_semaforo(valor, ideal_min, ideal_max, tolerancia):
+    if valor is None:
+        return None, "#6c757d", "⚪", "Sin datos"
+    if ideal_min <= valor <= ideal_max:
+        puntaje = 100
+    else:
+        distancia = (ideal_min - valor) if valor < ideal_min else (valor - ideal_max)
+        penalizacion = (distancia / tolerancia) * 60
+        puntaje = int(np.clip(round(100 - penalizacion), 1, 99))
+
+    if puntaje >= 80:
+        return puntaje, "#28a745", "🟢", "Óptimo"
+    elif puntaje >= 50:
+        return puntaje, "#ffc107", "🟡", "Aceptable"
+    else:
+        return puntaje, "#dc3545", "🔴", "A mejorar"
+
+def renderizar_tarjeta_semaforo(titulo, valor_txt, meta_txt, puntaje, color_hex, emoji, estado_txt):
+    puntaje_str = f"{puntaje} / 100" if puntaje is not None else "N/D"
+    html = f"""
+    <div style="border-left: 6px solid {color_hex}; background-color: rgba(255,255,255,0.04); padding: 14px 16px; border-radius: 8px; margin-bottom: 10px; border: 1px solid rgba(255,255,255,0.1); border-left-width: 6px;">
+        <div style="font-size: 0.85rem; color: #aaa; margin-bottom: 4px;">{titulo}</div>
+        <div style="font-size: 1.55rem; font-weight: 700; margin-bottom: 6px;">{valor_txt}</div>
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-top: 6px;">
+            <span style="background-color: {color_hex}22; color: {color_hex}; border: 1px solid {color_hex}; padding: 2px 9px; border-radius: 12px; font-weight: 700; font-size: 0.85rem;">
+                {emoji} {puntaje_str} · {estado_txt}
+            </span>
+        </div>
+        <div style="font-size: 0.78rem; color: #888; margin-top: 6px;">{meta_txt}</div>
+    </div>
+    """
+    st.markdown(html, unsafe_allow_html=True)
+
+# =====================================================================
+# BARRA LATERAL
+# =====================================================================
+with st.sidebar:
+    st.header("⚙️ Configuración Universal")
+    estatura_m = st.number_input("Estatura real del atleta (m)", min_value=1.20, max_value=2.30, value=1.69, step=0.01)
+    velocidad_video = st.select_slider("Velocidad de reproducción del video", options=[0.1, 0.25, 0.5, 1.0], value=0.25)
+
+# =====================================================================
+# CARGA Y PROCESAMIENTO
+# =====================================================================
+archivo_subido = st.file_uploader("Sube tu video de salto (.mp4, .mov)", type=["mp4", "mov", "avi"])
+
+if archivo_subido is not None:
+    if st.session_state.video_id != archivo_subido.name:
+        tfile = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+        tfile.write(archivo_subido.read())
+        st.session_state.ruta_video = tfile.name
+        st.session_state.video_id = archivo_subido.name
+        st.session_state.datos_salto = None
+
+    ruta_video = st.session_state.ruta_video
+
+    if st.button("🚀 Analizar Salto Universalmente", type="primary"):
+        modelo_path = asegurar_modelo()
+
+        with st.spinner("Procesando fotogramas y aplicando motor universal de IA..."):
+            video = cv2.VideoCapture(ruta_video)
+            fps = video.get(cv2.CAP_PROP_FPS)
+            ancho_v = int(video.get(cv2.CAP_PROP_FRAME_WIDTH))
+            alto_v = int(video.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            total_frames_video = int(video.get(cv2.CAP_PROP_FRAME_COUNT))
+
+            opciones = mp.tasks.vision.PoseLandmarkerOptions(
+                base_options=mp.tasks.BaseOptions(model_asset_path=modelo_path),
+                running_mode=mp.tasks.vision.RunningMode.IMAGE,
+                num_poses=1
+            )
+
+            puntos = {}
+            cx, cy = None, None
+            MAX_SALTO_PX = 160
+
+            k = 0
+            with mp.tasks.vision.PoseLandmarker.create_from_options(opciones) as detector:
+                while True:
+                    ok, frame = video.read()
+                    if not ok:
+                        break
+                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+                    if cx is None or cy is None:
+                        res = detector.detect(mp.Image(image_format=mp.ImageFormat.SRGB, data=frame_rgb))
+                        if res.pose_landmarks:
+                            persona = res.pose_landmarks[0]
+                            cx = sum(persona[i].x for i in (11, 12, 23, 24)) / 4 * ancho_v
+                            cy = sum(persona[i].y for i in (11, 12, 23, 24)) / 4 * alto_v
+                            puntos[k] = np.array([[p.x * ancho_v, p.y * alto_v] for p in persona])
+                    else:
+                        TAM_RECORTE = 720
+                        x0 = int(min(max(cx - TAM_RECORTE // 2, 0), ancho_v - TAM_RECORTE))
+                        y0 = int(min(max(cy - TAM_RECORTE // 2, 0), alto_v - TAM_RECORTE))
+                        recorte = np.ascontiguousarray(frame_rgb[y0:y0 + TAM_RECORTE, x0:x0 + TAM_RECORTE])
+                        res = detector.detect(mp.Image(image_format=mp.ImageFormat.SRGB, data=recorte))
+
+                        if res.pose_landmarks:
+                            persona = res.pose_landmarks[0]
+                            tx = sum(persona[i].x for i in (11, 12, 23, 24)) / 4 * TAM_RECORTE
+                            ty = sum(persona[i].y for i in (11, 12, 23, 24)) / 4 * TAM_RECORTE
+                            dist = ((tx + x0 - cx) ** 2 + (ty + y0 - cy) ** 2) ** 0.5
+                            if dist <= MAX_SALTO_PX:
+                                puntos[k] = np.array([[p.x * TAM_RECORTE + x0, p.y * TAM_RECORTE + y0] for p in persona])
+                                cx, cy = tx + x0, ty + y0
+                    k += 1
+            video.release()
+
+            if not puntos:
+                st.error("❌ No se pudo detectar al atleta en el video.")
+                st.stop()
+
+            f_min, f_max = min(puntos.keys()), max(puntos.keys())
+
+            REDUCCION_FONDO = 0.5
+            cap = cv2.VideoCapture(ruta_video)
+            cap.set(cv2.CAP_PROP_POS_FRAMES, f_min)
+
+            def leer_gris():
+                ok, img = cap.read()
+                return cv2.resize(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY), None, fx=REDUCCION_FONDO, fy=REDUCCION_FONDO) if ok else None
+
+            previo = leer_gris()
+            acumulado = np.zeros(2)
+            camara_raw = {f_min: acumulado.copy()}
+            pose_ref = puntos[f_min]            # última pose conocida (sirve para tapar al atleta en la máscara)
+            ultimo_d = np.zeros(2)              # último movimiento de cámara conocido
+            fallos = 0
+            MAX_FALLOS = max(5, int(0.25 * fps))
+            for f in range(f_min + 1, f_max + 1):
+                actual = leer_gris()
+                if actual is None:
+                    break
+                if (f - 1) in puntos:
+                    pose_ref = puntos[f - 1]
+                d = mov_fondo(previo, actual, mascara_sin_atleta(previo.shape, pose_ref * REDUCCION_FONDO))
+                if d is None:
+                    # no se pudo medir el fondo en este frame: se repite el último movimiento conocido
+                    # (antes el análisis se cortaba aquí, y todo lo posterior se perdía)
+                    fallos += 1
+                    if fallos > MAX_FALLOS:
+                        break
+                    d = ultimo_d
+                else:
+                    fallos = 0
+                    ultimo_d = d
+                acumulado = acumulado + d / REDUCCION_FONDO
+                camara_raw[f] = acumulado.copy()
+                previo = actual
+            cap.release()
+
+            try:
+                f_ap_auto, f_de_auto, f_at_auto, pierna_auto = detectar_fases_y_pierna_auto(puntos, camara_raw, fps)
+            except Exception:
+                f_mid = (f_min + f_max) // 2
+                f_ap_auto, f_de_auto, f_at_auto, pierna_auto = f_mid, f_mid + 6, f_mid + 25, "Derecha"
+
+            ultimo_cam = max(camara_raw.keys())
+            aviso_tracking = None
+            if f_at_auto >= ultimo_cam - 1 or ultimo_cam < f_max - int(0.1 * fps):
+                aviso_tracking = (f"⚠️ El seguimiento de la cámara terminó en el frame {ultimo_cam} "
+                                  f"(hay detecciones del atleta hasta el {f_max}). "
+                                  "Revisa el aterrizaje y ajústalo con los controles manuales.")
+
+            st.session_state.datos_salto = {
+                "puntos": puntos,
+                "camara_raw": camara_raw,
+                "fps": fps,
+                "ancho_v": ancho_v,
+                "alto_v": alto_v,
+                "total_frames_video": total_frames_video,
+                "f_min": f_min,
+                "f_max": f_max,
+                "f_ap_auto": f_ap_auto,
+                "f_de_auto": f_de_auto,
+                "f_at_auto": f_at_auto,
+                "pierna_auto": pierna_auto,
+                "aviso_tracking": aviso_tracking
+            }
+
+    # =====================================================================
+    # RESULTADOS, DIAGNÓSTICO Y FIABILIDAD
+    # =====================================================================
+    if st.session_state.datos_salto is not None:
+        ds = st.session_state.datos_salto
+        puntos = ds["puntos"]
+        camara_raw = ds["camara_raw"]
+        fps = ds["fps"]
+        ancho_v = ds["ancho_v"]
+        alto_v = ds["alto_v"]
+        total_frames_video = ds["total_frames_video"]
+        f_min, f_max = ds["f_min"], ds["f_max"]
+
+        frame_apoyo = ds["f_ap_auto"]
+        FRAME_DESPEGUE = ds["f_de_auto"]
+        FRAME_ATERRIZAJE = ds["f_at_auto"]
+        pierna_batida = ds["pierna_auto"]
+
+        if ds.get("aviso_tracking"):
+            st.warning(ds["aviso_tracking"])
+
+        with st.expander("⚙️ Ajuste Fino Manual (Opcional)", expanded=False):
+            col_opt1, col_opt2, col_opt3, col_opt4 = st.columns(4)
+            with col_opt1:
+                pierna_batida = st.selectbox("Pierna de Batida", ["Derecha", "Izquierda"],
+                                             index=0 if ds["pierna_auto"] == "Derecha" else 1)
+            with col_opt2:
+                frame_apoyo = st.slider("Frame de Apoyo", min_value=f_min, max_value=f_max - 2, value=ds["f_ap_auto"])
+            with col_opt3:
+                FRAME_DESPEGUE = st.slider("Frame de Despegue", min_value=f_min, max_value=f_max - 1, value=ds["f_de_auto"])
+            with col_opt4:
+                FRAME_ATERRIZAJE = st.slider("Frame de Aterrizaje", min_value=f_min, max_value=f_max, value=ds["f_at_auto"])
+
+            vp1, vp2, vp3 = st.columns(3)
+            with vp1:
+                img_ap = obtener_miniatura_frame(ruta_video, frame_apoyo, puntos, pierna_batida)
+                if img_ap is not None:
+                    st.image(img_ap, caption=f"Apoyo (f.{frame_apoyo})", use_container_width=True)
+            with vp2:
+                img_de = obtener_miniatura_frame(ruta_video, FRAME_DESPEGUE, puntos, pierna_batida)
+                if img_de is not None:
+                    st.image(img_de, caption=f"Despegue (f.{FRAME_DESPEGUE})", use_container_width=True)
+            with vp3:
+                img_at = obtener_miniatura_frame(ruta_video, FRAME_ATERRIZAJE, puntos, pierna_batida)
+                if img_at is not None:
+                    st.image(img_at, caption=f"Aterrizaje (f.{FRAME_ATERRIZAJE})", use_container_width=True)
+
+        if frame_apoyo >= FRAME_DESPEGUE:
+            FRAME_DESPEGUE = frame_apoyo + 1
+        if FRAME_DESPEGUE >= FRAME_ATERRIZAJE:
+            FRAME_ATERRIZAJE = FRAME_DESPEGUE + 1
+
+        # ASIGNACIÓN ESTRICTA Y LIMPIA SEGÚN LA PIERNA SELECCIONADA
+        if pierna_batida == "Derecha":
+            CAD_AP, ROD_AP, TOB_AP = CADERA_D, RODILLA_D, TOBILLO_D
+            PIERNA_APOYO = [(24, 26), (26, 28), (28, 30), (30, 32), (28, 32)]
+            PIERNA_LIBRE = [(23, 25), (25, 27), (27, 29), (29, 31), (27, 31)]
+            ROD_LIBRE = RODILLA_I
+            TOB_LIBRE = TOBILLO_I
+        else:
+            CAD_AP, ROD_AP, TOB_AP = CADERA_I, RODILLA_I, TOBILLO_I
+            PIERNA_APOYO = [(23, 25), (25, 27), (27, 29), (29, 31), (27, 31)]
+            PIERNA_LIBRE = [(24, 26), (26, 28), (28, 30), (30, 32), (28, 32)]
+            ROD_LIBRE = RODILLA_D
+            TOB_LIBRE = TOBILLO_D
+
+        # --- CÁLCULOS BIOMECÁNICOS ---
+        largos_pierna = [np.linalg.norm(puntos[f][c] - puntos[f][r]) + np.linalg.norm(puntos[f][r] - puntos[f][t])
+                         for f in range(frame_apoyo, min(frame_apoyo + 12, f_max)) if f in puntos
+                         for c, r, t in ((CADERA_I, RODILLA_I, TOBILLO_I), (CADERA_D, RODILLA_D, TOBILLO_D))]
+        escala = 0.491 * estatura_m / np.median(largos_pierna) if largos_pierna else 0.002
+
+        ref_cam = camara_raw.get(FRAME_DESPEGUE, np.zeros(2)).copy()
+        camara = {f: v - ref_cam for f, v in camara_raw.items()}
+        ultimo = max(camara) if camara else f_max
+
+        def pie_bajo(f):
+            return puntos[f][PIES, 1].max() - camara.get(f, np.zeros(2))[1]
+        y_suelo = np.median([pie_bajo(f) for f in range(max(f_min, FRAME_DESPEGUE - 7), FRAME_DESPEGUE + 1) if f in camara and f in puntos])
+
+        cadera = {f: (puntos[f][CADERA_I] + puntos[f][CADERA_D]) / 2 for f in camara if f in puntos}
+        mundo = {f: cadera[f] - camara[f] for f in cadera}
+        sentido = 1 if np.mean([puntos[f][NARIZ][0] - cadera[f][0] for f in range(frame_apoyo, min(FRAME_DESPEGUE + 1, f_max)) if f in puntos]) >= 0 else -1
+
+        idx_vuelo_ini = FRAME_DESPEGUE + int((FRAME_ATERRIZAJE - FRAME_DESPEGUE) * 0.2)
+        idx_vuelo_fin = FRAME_ATERRIZAJE - int((FRAME_ATERRIZAJE - FRAME_DESPEGUE) * 0.2)
+        ks_puro = np.arange(idx_vuelo_ini, idx_vuelo_fin + 1)
+        if len(ks_puro) < 3:
+            ks_puro = np.arange(FRAME_DESPEGUE, FRAME_ATERRIZAJE + 1)
+
+        ks_todos = np.arange(FRAME_DESPEGUE, min(FRAME_ATERRIZAJE + 1, ultimo + 1))
+
+        # Solo se usan los frames donde la IA sí detectó al atleta (así los tiempos y las posiciones
+        # siempre tienen el mismo largo, aunque falten algunos frames en medio del vuelo)
+        ks_todos = np.array([f for f in ks_todos if f in mundo])
+        ks_puro = np.array([f for f in ks_puro if f in mundo])
+        if len(ks_puro) == 0:
+            ks_puro = ks_todos
+        if len(ks_todos) > 1:
+            t_todos = (ks_todos - FRAME_DESPEGUE) / fps
+            W_todos = np.array([mundo[f] for f in ks_todos if f in mundo])
+            x_m = (W_todos[:, 0] - W_todos[0, 0]) * sentido * escala
+            y_m = -(W_todos[:, 1] - W_todos[0, 1]) * escala
+
+            t_puro = (ks_puro - FRAME_DESPEGUE) / fps
+            W_puro = np.array([mundo[f] for f in ks_puro if f in mundo])
+            x_puro = (W_puro[:, 0] - W_puro[0, 0]) * sentido * escala
+            y_puro = -(W_puro[:, 1] - W_puro[0, 1]) * escala
+
+            vx_m = np.polyfit(t_todos, x_m, 1)[0]
+            a2, vy_m, _ = np.polyfit(t_puro, y_puro, 2) if len(t_puro) > 2 else np.polyfit(t_todos, y_m, 2)
+            v0 = float(np.hypot(vx_m, vy_m))
+            ang_salida = float(np.degrees(np.arctan2(vy_m, vx_m)))
+        else:
+            v0, ang_salida, a2, x_m, y_m = 0.0, 0.0, 0.0, np.array([0]), np.array([0])
+
+        t_vuelo = max(0.0, (FRAME_ATERRIZAJE - FRAME_DESPEGUE) / fps)
+        t_contacto = max(0.0, (FRAME_DESPEGUE - frame_apoyo) / fps * 1000)
+
+        umbral_px = 0.10 * estatura_m / escala
+        pts_limpios, picos_corregidos = quitar_picos(puntos, f_min, f_max, umbral_px)
+
+        # MÁXIMA FLEXIÓN DE RODILLA (curva suavizada para que el mínimo no 'salte' entre frames)
+        flexion_max_rodilla, frame_max_flexion, frames_batida, ang_crudo, ang_suave = flexion_maxima_rodilla(
+            pts_limpios, frame_apoyo, FRAME_DESPEGUE, CAD_AP, ROD_AP, TOB_AP)
+
+        extension_despegue = angulo(pts_limpios[FRAME_DESPEGUE][CAD_AP], pts_limpios[FRAME_DESPEGUE][ROD_AP], pts_limpios[FRAME_DESPEGUE][TOB_AP]) if FRAME_DESPEGUE in pts_limpios else 0.0
+
+        # ÁNGULO DE ATAQUE DE LA PIERNA EN EL APOYO
+        p_contacto = pts_limpios.get(frame_apoyo, pts_limpios[min(pts_limpios.keys())])
+        dx_p = (p_contacto[CAD_AP][0] - p_contacto[TOB_AP][0]) * sentido
+        dy_p = p_contacto[TOB_AP][1] - p_contacto[CAD_AP][1]
+        angulo_ataque_pierna = float(np.degrees(np.arctan2(dy_p, abs(dx_p))))
+
+        # ÁNGULO INTER-RODILLAS EN EL FRAME DE APOYO (Calculado directamente entre las dos rodillas respecto al punto medio de las caderas)
+        p_cad_centro = (p_contacto[CADERA_I] + p_contacto[CADERA_D]) / 2
+        v_rod_batida = p_contacto[ROD_AP] - p_cad_centro
+        v_rod_libre = p_contacto[ROD_LIBRE] - p_cad_centro
+        cos_ik = np.dot(v_rod_batida, v_rod_libre) / (np.linalg.norm(v_rod_batida) * np.linalg.norm(v_rod_libre) + 1e-6)
+        angulo_inter_rodillas = float(np.degrees(np.arccos(np.clip(cos_ik, -1, 1))))
+
+        # FÓRMULA DE PUNTUACIÓN EXACTA SOLICITADA
+        score_ik = max(1.0, 100.0 - abs(angulo_inter_rodillas - 31.0) / 0.15)
+        p_ik = int(np.clip(round(score_ik), 1, 100))
+        if 25 <= angulo_inter_rodillas <= 38:
+            col_ik, em_ik, est_ik = "#28a745", "🟢", "Óptimo (Élite)"
+        elif 18 <= angulo_inter_rodillas <= 24 or 39 <= angulo_inter_rodillas <= 46:
+            col_ik, em_ik, est_ik = "#ffc107", "🟡", "Aceptable"
+        else:
+            col_ik, em_ik, est_ik = "#dc3545", "🔴", "Crítico / Defectuoso"
+
+        frames_prev = [f for f in range(max(min(mundo), frame_apoyo - 25), frame_apoyo - 5) if f in mundo]
+        descenso_cm_val = (mundo[frame_apoyo][1] - min(mundo[f][1] for f in frames_prev)) * escala * 100 if frames_prev and frame_apoyo in mundo else None
+
+        # --- ENCABEZADO ---
+        st.success(f"✅ **Análisis completado** · Batida: **{pierna_batida}** · Apoyo: **f.{frame_apoyo}** | Despegue: **f.{FRAME_DESPEGUE}** | Aterrizaje: **f.{FRAME_ATERRIZAJE}**")
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Velocidad de Salida", f"{v0:.2f} m/s", f"{v0 * 3.6:.1f} km/h")
+        c2.metric("Ángulo de Salida", f"{ang_salida:.1f}°")
+        c3.metric("Tiempo de Contacto", f"{t_contacto:.0f} ms")
+        c4.metric("Avance en Vuelo", f"{x_m[-1]:.2f} m" if len(x_m) > 0 else "0 m", f"Vuelo: {t_vuelo:.2f} s")
+
+        # =====================================================================
+        # DIAGNÓSTICO TÉCNICO
+        # =====================================================================
+        st.subheader("📋 Diagnóstico Técnico según Criterios del Entrenador")
+
+        p_flex, col_flex, em_flex, est_flex = calcular_puntaje_semaforo(flexion_max_rodilla, 140.0, 155.0, tolerancia=25.0)
+        p_ext, col_ext, em_ext, est_ext = calcular_puntaje_semaforo(extension_despegue, 168.0, 180.0, tolerancia=20.0)
+        p_ataq, col_ataq, em_ataq, est_ataq = calcular_puntaje_semaforo(angulo_ataque_pierna, 55.0, 65.0, tolerancia=15.0)
+        p_desc, col_desc, em_desc, est_desc = calcular_puntaje_semaforo(descenso_cm_val, 7.0, 8.0, tolerancia=5.0)
+
+        puntajes_validos = [p for p in [p_flex, p_ext, p_ataq, p_ik, p_desc] if p is not None]
+        puntaje_global = int(round(np.mean(puntajes_validos))) if puntajes_validos else 0
+        if puntaje_global >= 80:
+            col_glob, em_glob, est_glob = "#28a745", "🟢", "Ejecución Técnica Sobresaliente"
+        elif puntaje_global >= 50:
+            col_glob, em_glob, est_glob = "#ffc107", "🟡", "Ejecución Técnica en Desarrollo"
+        else:
+            col_glob, em_glob, est_glob = "#dc3545", "🔴", "Requiere Corrección Técnica"
+
+        st.markdown(f"""
+        <div style="background-color: {col_glob}18; border: 1px solid {col_glob}; border-radius: 10px; padding: 12px 18px; margin-bottom: 16px; display: flex; align-items: center; justify-content: space-between;">
+            <span style="font-size: 1.05rem; font-weight: 600;">{em_glob} Puntaje Técnico Global del Salto</span>
+            <span style="font-size: 1.3rem; font-weight: 800; color: {col_glob};">{puntaje_global} / 100 — {est_glob}</span>
+        </div>
+        """, unsafe_allow_html=True)
+
+        e1, e2, e3, e4, e5 = st.columns(5)
+        with e1:
+            renderizar_tarjeta_semaforo("Máx. Flexión Rodilla", f"{flexion_max_rodilla:.1f}° (f.{frame_max_flexion})", "Meta ideal: 140° – 155°", p_flex, col_flex, em_flex, est_flex)
+        with e2:
+            renderizar_tarjeta_semaforo("Extensión Despegue", f"{extension_despegue:.1f}° (f.{FRAME_DESPEGUE})", "Meta ideal: ~170°+", p_ext, col_ext, em_ext, est_ext)
+        with e3:
+            renderizar_tarjeta_semaforo("Ángulo Ataque Pierna", f"{angulo_ataque_pierna:.1f}° (f.{frame_apoyo})", "Meta ideal: 55° – 65°", p_ataq, col_ataq, em_ataq, est_ataq)
+        with e4:
+            renderizar_tarjeta_semaforo("Ángulo Inter-rodillas", f"{angulo_inter_rodillas:.1f}° (f.{frame_apoyo})", "Meta ideal: 25° – 38°", p_ik, col_ik, em_ik, est_ik)
+        with e5:
+            val_desc_txt = f"{descenso_cm_val:.1f} cm" if descenso_cm_val is not None else "N/D"
+            renderizar_tarjeta_semaforo("Descenso CM", val_desc_txt, "Meta ideal: 7.0 – 8.0 cm", p_desc, col_desc, em_desc, est_desc)
+
+        with st.expander("🔍 Depuración: ángulo de rodilla frame a frame", expanded=False):
+            st.dataframe({"frame": frames_batida,
+                          "ángulo crudo (°)": np.round(ang_crudo, 1),
+                          "ángulo suavizado (°)": np.round(ang_suave, 1)}, use_container_width=True)
+            st.line_chart({"crudo": ang_crudo, "suavizado": ang_suave})
+
+        # =====================================================================
+        # AUDITORÍA DE FIABILIDAD
+        # =====================================================================
+        st.divider()
+        st.subheader("🛡️ Fiabilidad y Calidad de los Datos Medidos")
+
+        grav_est = float(-2 * a2)
+        p_grav, col_grav, em_grav, est_grav = calcular_puntaje_semaforo(grav_est, 8.5, 11.0, tolerancia=4.0)
+
+        rango_critico = list(range(max(f_min, frame_apoyo - 10), min(f_max, FRAME_ATERRIZAJE + 5) + 1))
+        frames_detectados_criticos = sum(1 for f in rango_critico if f in puntos)
+        cobertura_pct = (frames_detectados_criticos / len(rango_critico) * 100.0) if rango_critico else 0.0
+        p_track, col_track, em_track, est_track = calcular_puntaje_semaforo(cobertura_pct, 95.0, 100.0, tolerancia=25.0)
+
+        cv_pierna = (np.std(largos_pierna) / np.mean(largos_pierna) * 100.0) if len(largos_pierna) > 2 else 15.0
+        p_escala, col_escala, em_escala, est_escala = calcular_puntaje_semaforo(cv_pierna, 0.0, 5.0, tolerancia=10.0)
+
+        fiabilidad_global = int(round(np.mean([p_grav, p_track, p_escala])))
+        if fiabilidad_global >= 80:
+            col_fia, em_fia, est_fia = "#28a745", "🟢", "Datos Altamente Confiables"
+        elif fiabilidad_global >= 50:
+            col_fia, em_fia, est_fia = "#ffc107", "🟡", "Fiabilidad Moderada"
+        else:
+            col_fia, em_fia, est_fia = "#dc3545", "🔴", "Baja Fiabilidad"
+
+        st.markdown(f"""
+        <div style="background-color: {col_fia}18; border: 1px solid {col_fia}; border-radius: 10px; padding: 10px 18px; margin-bottom: 14px; display: flex; align-items: center; justify-content: space-between;">
+            <span style="font-size: 1.0rem; font-weight: 600;">{em_fia} Índice Global de Fiabilidad de Medición</span>
+            <span style="font-size: 1.25rem; font-weight: 800; color: {col_fia};">{fiabilidad_global} / 100 — {est_fia}</span>
+        </div>
+        """, unsafe_allow_html=True)
+
+        f1, f2, f3 = st.columns(3)
+        with f1:
+            renderizar_tarjeta_semaforo("Validación Física (Gravedad)", f"{grav_est:.2f} m/s²", "Ideal terrestre: 9.81 m/s² (8.5–11.0)", p_grav, col_grav, em_grav, est_grav)
+        with f2:
+            renderizar_tarjeta_semaforo("Estabilidad Tracking IA", f"{cobertura_pct:.0f}%", f"Picos corregidos: {picos_corregidos} · Ideal ≥ 95%", p_track, col_track, em_track, est_track)
+        with f3:
+            renderizar_tarjeta_semaforo("Consistencia de Perspectiva", f"±{cv_pierna:.1f}% var.", "Variación ósea · Ideal < 5.0%", p_escala, col_escala, em_escala, est_escala)
+
+        # =====================================================================
+        # VIDEO Y GRÁFICOS
+        # =====================================================================
+        st.divider()
+        with st.spinner("Generando video completo anotado..."):
+            temp_raw = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4").name
+            final_mp4 = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4").name
+
+            cap = cv2.VideoCapture(ruta_video)
+            ESCALA_V = 0.5
+            tam_s = (int(ancho_v * ESCALA_V), int(alto_v * ESCALA_V))
+            salida = cv2.VideoWriter(temp_raw, cv2.VideoWriter_fourcc(*"mp4v"), fps * velocidad_video, tam_s)
+
+            grosor = max(3, ancho_v // 150)
+            fuente_g = cargar_fuente(int(ancho_v / 18))
+            fuente_p = cargar_fuente(int(ancho_v / 25))
+            HOM_AP = HOMBRO_D if pierna_batida == "Derecha" else HOMBRO_I
+
+            f_actual = 0
+            while True:
+                ok, img = cap.read()
+                if not ok:
+                    break
+
+                if f_actual in pts_limpios:
+                    p = pts_limpios[f_actual]
+                    for conexiones, color in ((CUERPO, VERDE), (PIERNA_LIBRE, NARANJA), (PIERNA_APOYO, AZUL)):
+                        for a, b in conexiones:
+                            cv2.line(img, tuple(p[a].astype(int)), tuple(p[b].astype(int)), color, grosor, cv2.LINE_AA)
+
+                    hombros, caderas = (p[11] + p[12]) / 2, (p[23] + p[24]) / 2
+                    inc_tronco = inclinacion(caderas, hombros, sentido)
+                    ang_cadera = angulo(p[HOM_AP], p[CAD_AP], p[ROD_AP])
+                    ang_rodilla = angulo(p[CAD_AP], p[ROD_AP], p[TOB_AP])
+
+                    base = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB)).convert("RGBA")
+                    capa = Image.new("RGBA", base.size, (0, 0, 0, 0))
+                    d = ImageDraw.Draw(capa)
+                    etiquetas_apiladas_fijas(d, [(hombros, f"TRONCO {round(inc_tronco)}°"),
+                                                 (p[CAD_AP], f"CADERA {round(ang_cadera)}°"),
+                                                 (p[ROD_AP], f"RODILLA {round(ang_rodilla)}°")], fuente_p, ancho_v, sentido)
+                else:
+                    base = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB)).convert("RGBA")
+                    capa = Image.new("RGBA", base.size, (0, 0, 0, 0))
+                    d = ImageDraw.Draw(capa)
+
+                if f_actual < frame_apoyo:
+                    fase_txt = "Aproximación"
+                elif f_actual < FRAME_DESPEGUE:
+                    fase_txt = "Apoyo → Despegue"
+                elif f_actual <= FRAME_ATERRIZAJE:
+                    fase_txt = "Vuelo"
+                else:
+                    fase_txt = "Aterrizaje"
+
+                y_hud = int(ancho_v * 0.03)
+                for texto, fuente in ((fase_txt, fuente_g),
+                                      (f"FRAME {f_actual}   t = {(f_actual - FRAME_DESPEGUE) / fps * 1000:+.0f} ms", fuente_p),
+                                      (f"Vuelo {t_vuelo:.2f} s", fuente_p),
+                                      (f"Salida {v0:.1f} m/s · {ang_salida:.0f}°", fuente_p)):
+                    pastilla(d, int(ancho_v * 0.03), y_hud, texto, fuente)
+                    y_hud += medir(d, texto, fuente)[1] + int(ancho_v * 0.012)
+
+                img = cv2.cvtColor(np.array(Image.alpha_composite(base, capa).convert("RGB")), cv2.COLOR_RGB2BGR)
+                salida.write(cv2.resize(img, tam_s))
+                f_actual += 1
+
+            cap.release()
+            salida.release()
+            subprocess.run([
+                "ffmpeg", "-y", "-loglevel", "error", "-i", temp_raw,
+                "-vcodec", "libx264", "-pix_fmt", "yuv420p", "-movflags", "+faststart", final_mp4
+            ], check=True)
+
+        with open(final_mp4, "rb") as f_vid:
+            video_bytes = f_vid.read()
+
+        col_vid, col_graf = st.columns([1, 1.2])
+
+        with col_vid:
+            st.subheader("🎬 Video Anotado Completo")
+            st.video(video_bytes)
+            st.download_button("⬇️ Descargar Video Completo Analizado", video_bytes, file_name="salto_analizado_completo.mp4", mime="video/mp4")
+
+        with col_graf:
+            st.subheader("📈 Validación Física y Detección de Fases")
+            fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(7, 7))
+
+            ax1.plot(x_m, y_m, "-o", color="tab:blue", label="Trayectoria real del CM")
+            ax1.set_xlabel("Avance (m)")
+            ax1.set_ylabel("Altura (m)")
+            ax1.set_title(f"Parábola de Vuelo (Gravedad estimada: {grav_est:.1f} m/s² | Ref: 9.8 m/s²)")
+            ax1.grid(alpha=0.3)
+            ax1.legend()
+
+            ks_pie = sorted(f for f in camara.keys() if f in puntos)
+            altura_cm = [(y_suelo - pie_bajo(f)) * escala * 100 for f in ks_pie if f in puntos]
+            ax2.plot(ks_pie[:len(altura_cm)], altura_cm, "-o", ms=3, color="tab:orange", label="Altura del pie")
+            ax2.axhline(0, color="gray")
+            ax2.axvline(frame_apoyo, color="blue", ls="--", label=f"Apoyo (f.{frame_apoyo})")
+            ax2.axvline(FRAME_DESPEGUE, color="purple", ls="--", label=f"Despegue (f.{FRAME_DESPEGUE})")
+            ax2.axvline(FRAME_ATERRIZAJE, color="green", ls="--", label=f"Aterrizaje (f.{FRAME_ATERRIZAJE})")
+            ax2.set_xlabel("Frame")
+            ax2.set_ylabel("Altura del pie (cm)")
+            ax2.set_title("Control de Fases Detectadas")
+            ax2.grid(alpha=0.3)
+            ax2.legend()
+
+            plt.tight_layout()
+            st.pyplot(fig)
