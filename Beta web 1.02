@@ -1,0 +1,1697 @@
+%%writefile app_salto.py
+import os
+import json
+import tempfile
+import subprocess
+import cv2
+import numpy as np
+import matplotlib
+import matplotlib.pyplot as plt
+import mediapipe as mp
+import streamlit as st
+from PIL import Image, ImageDraw, ImageFont
+
+# =====================================================================
+# CONFIGURACIÓN DE PÁGINA
+# =====================================================================
+st.set_page_config(page_title="JumpLab AI - Análisis Biomecánico", page_icon="🏃‍♂️", layout="wide")
+
+st.title("🏃‍♂️ JumpLab AI — Análisis Biomecánico de Salto")
+st.markdown("Motor biomecánico de precisión con anclaje anatómico definitivo y corrección estricta de métricas.")
+
+if "datos_salto" not in st.session_state:
+    st.session_state.datos_salto = None
+if "video_id" not in st.session_state:
+    st.session_state.video_id = None
+
+# =====================================================================
+# CONSTANTES Y FUNCIONES AUXILIARES
+# =====================================================================
+NARIZ = 0
+HOMBRO_I, HOMBRO_D = 11, 12
+CADERA_I, CADERA_D = 23, 24
+RODILLA_I, RODILLA_D = 25, 26
+TOBILLO_I, TOBILLO_D = 27, 28
+TALON_I, TALON_D = 29, 30
+PUNTA_I, PUNTA_D = 31, 32
+
+PIES = [27, 28, 29, 30, 31, 32]
+CUERPO = [(11, 13), (13, 15), (12, 14), (14, 16), (11, 12), (11, 23), (12, 24), (23, 24)]
+AZUL, NARANJA, VERDE = (255, 110, 20), (0, 150, 255), (60, 230, 60)
+
+MODELO_PATH = "pose_landmarker.task"
+
+@st.cache_resource
+def asegurar_modelo():
+    if not os.path.exists(MODELO_PATH):
+        url = "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_heavy/float16/1/pose_landmarker_heavy.task"
+        subprocess.run(["wget", "-q", url, "-O", MODELO_PATH], check=True)
+    return MODELO_PATH
+
+def angulo(a, b, c):
+    ba, bc = a - b, c - b
+    cos = np.dot(ba, bc) / (np.linalg.norm(ba) * np.linalg.norm(bc) + 1e-6)
+    return float(np.degrees(np.arccos(np.clip(cos, -1, 1))))
+
+def suavizar_serie(valores, ventana=3):
+    """Promedio móvil. Reduce el ruido de MediaPipe sin correr la serie en el tiempo."""
+    v = np.asarray(valores, dtype=float)
+    if len(v) < ventana:
+        return v
+    mitad = ventana // 2
+    v_ext = np.pad(v, mitad, mode="edge")          # repite los bordes para no perder datos
+    return np.convolve(v_ext, np.ones(ventana) / ventana, mode="valid")
+
+def suavizar_savgol5(valores):
+    """Suavizado de 5 puntos (Savitzky-Golay, grado 2).
+    Reduce el ruido pero conserva mejor los valles que un promedio simple."""
+    v = np.asarray(valores, dtype=float)
+    if len(v) < 5:
+        return v
+    pesos = np.array([-3, 12, 17, 12, -3]) / 35.0
+    v_ext = np.pad(v, 2, mode="edge")
+    return np.convolve(v_ext, pesos, mode="valid")
+
+def flexion_maxima_rodilla(pts, frame_apoyo, frame_despegue, cad, rod, tob):
+    frames = [f for f in range(frame_apoyo, frame_despegue + 1) if f in pts]
+    if not frames:
+        return 0.0, frame_apoyo, [], np.array([]), np.array([])
+    crudo = np.array([angulo(pts[f][cad], pts[f][rod], pts[f][tob]) for f in frames])
+    suave = suavizar_savgol5(crudo)
+    i_min = int(np.argmin(suave))
+    return float(suave[i_min]), frames[i_min], frames, crudo, suave
+
+def inclinacion(desde, hasta, sentido, referencia="arriba"):
+    dx = (hasta[0] - desde[0]) * sentido
+    dy = hasta[1] - desde[1]
+    if referencia == "arriba":
+        dy = -dy
+    return float(np.degrees(np.arctan2(dx, dy)))
+
+def quitar_picos(pts_dict, ini, fin, umbral):
+    pts = {k: v.copy() for k, v in pts_dict.items()}
+    picos_corregidos = 0
+    for largo in (1, 2):
+        for k in range(ini, fin - largo + 2):
+            antes, despues = k - 1, k + largo
+            if any(j not in pts for j in range(antes, despues + 1)):
+                continue
+            for i in range(33):
+                a, b = pts[antes][i], pts[despues][i]
+                esperado = [a + (b - a) * (j + 1) / (largo + 1) for j in range(largo)]
+                desvio = min(np.linalg.norm(pts[k + j][i] - esperado[j]) for j in range(largo))
+                if desvio > max(umbral, 2.5 * np.linalg.norm(b - a)):
+                    picos_corregidos += 1
+                    for j in range(largo):
+                        pts[k + j][i] = esperado[j]
+    return pts, picos_corregidos
+
+def mascara_sin_atleta(forma, p, margen=0.3):
+    mascara = np.full(forma, 255, np.uint8)
+    x0, y0 = p.min(axis=0)
+    x1, y1 = p.max(axis=0)
+    m = margen * max(x1 - x0, y1 - y0)
+    cv2.rectangle(mascara, (int(x0 - m), int(y0 - m)), (int(x1 + m), int(y1 + m)), 0, -1)
+    return mascara
+
+# =====================================================================
+# FASE C: ATLETA ENTRE VARIAS PERSONAS Y CÁMARA ROBUSTA
+# =====================================================================
+REDUCCION_FONDO = 0.5            # los frames se reducen a la mitad para medir el movimiento de la cámara
+FONDO_ROBUSTO = True             # elige el movimiento de fondo más repetido (no la mediana), con memoria del frame anterior
+FONDO_CON_PREDICCION = True      # parte de la velocidad anterior de la cámara (ayuda en paneos fuertes)
+MAX_PERSONAS = 4                 # personas que busca la IA en cada recorte
+TAM_RECORTE = 720                # tamaño (px) del recorte donde se busca a la persona
+FPS_MUESTREO = 15                # frames por segundo que se revisan para decidir quién es el atleta
+IDX_TORSO = (11, 12, 23, 24)     # hombros y caderas: sirven de "centro" de la persona
+
+
+def _centro_dominante(d, previo_d):
+    """De todos los movimientos medidos, elige el más repetido (el fondo). Con gente moviéndose
+    por detrás, la mediana puede quedar en medio de dos grupos; aquí se elige un grupo."""
+    mediana = np.median(d, axis=0)
+    if not FONDO_ROBUSTO:
+        return mediana
+    muestra = d if len(d) <= 150 else d[np.linspace(0, len(d) - 1, 150).astype(int)]
+    dist = np.linalg.norm(muestra[:, None, :] - d[None, :, :], axis=2)
+    apoyo = (dist < 1.5).sum(axis=1).astype(float)
+    if previo_d is not None:
+        apoyo = apoyo * np.exp(-np.linalg.norm(muestra - np.asarray(previo_d), axis=1) / 10.0)
+    return muestra[int(np.argmax(apoyo))]
+
+
+def mov_fondo(g0, g1, mascara, previo_d=None):
+    """Cuánto se movió el fondo entre dos frames (en píxeles de la imagen reducida)."""
+    pts = cv2.goodFeaturesToTrack(g0, maxCorners=500, qualityLevel=0.01, minDistance=10, mask=mascara)
+    if pts is None:
+        return None
+    if previo_d is not None and FONDO_CON_PREDICCION:
+        inicial = (pts + np.asarray(previo_d, dtype=np.float32).reshape(1, 1, 2)).astype(np.float32)
+        nuevos, ok, _ = cv2.calcOpticalFlowPyrLK(g0, g1, pts, inicial, winSize=(31, 31), maxLevel=4,
+                                                 flags=cv2.OPTFLOW_USE_INITIAL_FLOW)
+    else:
+        nuevos, ok, _ = cv2.calcOpticalFlowPyrLK(g0, g1, pts, None, winSize=(31, 31), maxLevel=4)
+    d = (nuevos - pts).reshape(-1, 2)[ok.ravel() == 1]
+    if len(d) < 10:
+        return None
+    centro = _centro_dominante(d, previo_d)
+    buenos = d[np.linalg.norm(d - centro, axis=1) < 2]
+    if len(buenos) < 10:
+        return None
+    return buenos.mean(axis=0)
+
+
+def origenes_teselas(largo, tam, solape=0.4):
+    """Posiciones donde empiezan los recortes que cubren todo el largo del frame."""
+    if largo <= tam:
+        return [0]
+    paso = max(1, int(tam * (1 - solape)))
+    n = int(np.ceil((largo - tam) / paso)) + 1
+    return [int(round(i * (largo - tam) / (n - 1))) for i in range(n)]
+
+
+def fusionar_personas(personas, frac=0.35):
+    """personas: lista de (cx, cy, alto). Quita duplicados (la misma persona vista en dos recortes)."""
+    quedan = []
+    for p in sorted(personas, key=lambda t: -t[2]):
+        if all(np.hypot(p[0] - q[0], p[1] - q[1]) > frac * max(p[2], q[2]) for q in quedan):
+            quedan.append(p)
+    return quedan
+
+
+def recorte_centrado(frame_rgb, cx, cy, tam=720):
+    alto, ancho = frame_rgb.shape[:2]
+    tw, th = min(ancho, tam), min(alto, tam)
+    x0 = int(min(max(cx - tw // 2, 0), ancho - tw))
+    y0 = int(min(max(cy - th // 2, 0), alto - th))
+    return np.ascontiguousarray(frame_rgb[y0:y0 + th, x0:x0 + tw]), x0, y0, tw, th
+
+
+def detectar_personas_en_teselas(detector, frame_rgb, tam=720):
+    """Busca a TODAS las personas del frame, recorriendo el frame por recortes (así se ven también las pequeñas).
+    Devuelve una lista de (cx, cy, alto) en píxeles del frame."""
+    alto, ancho = frame_rgb.shape[:2]
+    tw, th = min(ancho, tam), min(alto, tam)
+    personas = []
+    for y0 in origenes_teselas(alto, th):
+        for x0 in origenes_teselas(ancho, tw):
+            tesela = np.ascontiguousarray(frame_rgb[y0:y0 + th, x0:x0 + tw])
+            res = detector.detect(mp.Image(image_format=mp.ImageFormat.SRGB, data=tesela))
+            for lm in (res.pose_landmarks or []):
+                pts = np.array([[p.x * tw + x0, p.y * th + y0] for p in lm])
+                h = float(pts[PIES, 1].max() - pts[NARIZ, 1])
+                if h < 20:
+                    continue
+                cx, cy = pts[list(IDX_TORSO)].mean(axis=0)
+                # una persona cortada por el borde de un recorte (que no es el borde del frame) sale mal medida:
+                # se descarta, porque el recorte vecino la ve completa
+                m = 0.25 * h
+                if (x0 > 0 and cx - x0 < m) or (x0 + tw < ancho and x0 + tw - cx < m) \
+                        or (y0 > 0 and cy - y0 < m) or (y0 + th < alto and y0 + th - cy < m):
+                    continue
+                personas.append((float(cx), float(cy), h))
+    return fusionar_personas(personas)
+
+
+def _predecir(p, f):
+    """Dónde debería estar una pista en el frame f (sigue su velocidad reciente)."""
+    n = min(4, len(p["f"]))
+    if n >= 2 and p["f"][-1] != p["f"][-n]:
+        dt_v = p["f"][-1] - p["f"][-n]
+        vx = (p["x"][-1] - p["x"][-n]) / dt_v
+        vy = (p["y"][-1] - p["y"][-n]) / dt_v
+        dt = f - p["f"][-1]
+        return p["x"][-1] + vx * dt, p["y"][-1] + vy * dt
+    return p["x"][-1], p["y"][-1]
+
+
+def construir_pistas(detecciones, camara, fps, max_hueco_s=0.6):
+    """Une las personas detectadas frame a frame en 'pistas' (una pista = una persona a lo largo del video).
+    detecciones: {frame: [(cx, cy, alto), ...]} en píxeles de la imagen
+    camara: {frame: array([x, y])} movimiento acumulado de la cámara
+    Las pistas quedan en coordenadas del MUNDO (imagen menos cámara): así el público, que está quieto,
+    parece quieto aunque la cámara gire siguiendo al atleta."""
+    pistas = []
+    max_hueco = max(1, int(round(max_hueco_s * fps)))
+    for f in sorted(detecciones):
+        cam = np.asarray(camara[f], dtype=float)
+        pers = [(c[0] - cam[0], c[1] - cam[1], c[2]) for c in detecciones[f]]
+        pares = []
+        for i, p in enumerate(pistas):
+            dt = f - p["f"][-1]
+            if dt > max_hueco:
+                continue
+            px, py = _predecir(p, f)
+            for j, q in enumerate(pers):
+                tope = max(p["h"][-1], q[2]) * (0.30 + 0.12 * dt)
+                d = float(np.hypot(q[0] - px, q[1] - py))
+                if d <= tope:
+                    pares.append((d / tope, i, j))
+        pares.sort()
+        usadas_p, usadas_q = set(), set()
+        for _, i, j in pares:
+            if i in usadas_p or j in usadas_q:
+                continue
+            usadas_p.add(i)
+            usadas_q.add(j)
+            q, p = pers[j], pistas[i]
+            p["f"].append(f); p["x"].append(q[0]); p["y"].append(q[1]); p["h"].append(q[2])
+        for j, q in enumerate(pers):
+            if j not in usadas_q:
+                pistas.append({"f": [f], "x": [q[0]], "y": [q[1]], "h": [q[2]]})
+    return pistas
+
+
+def velocidad_pista(p, fps, ventana_s=0.4):
+    """Rapidez horizontal típica de la pista, en alturas-de-cuerpo por segundo (un corredor va a 3-5; el público, cerca de 0)."""
+    f = np.asarray(p["f"], dtype=float)
+    x = np.asarray(p["x"], dtype=float)
+    h = float(np.median(p["h"]))
+    if len(f) < 4 or h <= 0:
+        return 0.0
+    vel = []
+    for i in range(len(f)):
+        j = int(np.searchsorted(f, f[i] + ventana_s * fps))
+        if j >= len(f):
+            break
+        dt = (f[j] - f[i]) / fps
+        if dt <= 0 or dt > 2 * ventana_s:
+            continue
+        vel.append(abs(x[j] - x[i]) / dt / h)
+    return float(np.percentile(vel, 90)) if vel else 0.0
+
+
+def _se_solapan(a, b, fps, min_s=0.5):
+    ini, fin = max(a["f"][0], b["f"][0]), min(a["f"][-1], b["f"][-1])
+    return (fin - ini) >= min_s * fps
+
+
+def elegir_pista_atleta(pistas, fps, min_muestras=4):
+    """El atleta es la persona que más se desplaza por el mundo (el público casi no se mueve).
+    Devuelve (índice de la pista elegida o None, información para los avisos)."""
+    cand = [(velocidad_pista(p, fps), i) for i, p in enumerate(pistas) if len(p["f"]) >= min_muestras]
+    if not cand:
+        return None, {"n_pistas": len(pistas), "n_validas": 0, "vel": 0.0, "vel_segunda": 0.0,
+                      "ambiguo": False, "sin_corredor": True}
+    cand.sort(reverse=True)
+    mejor_v, mejor_i = cand[0]
+    similares = [(v, i) for v, i in cand if v >= 0.8 * mejor_v]
+    if len(similares) > 1:      # entre las casi igual de rápidas, la más grande en el cuadro
+        mejor_v, mejor_i = max(similares, key=lambda t: float(np.median(pistas[t[1]]["h"])))
+    rivales = [v for v, i in cand if i != mejor_i and _se_solapan(pistas[i], pistas[mejor_i], fps)]
+    seg = max(rivales) if rivales else 0.0
+    return mejor_i, {"n_pistas": int(len(pistas)), "n_validas": int(len(cand)), "vel": float(mejor_v),
+                     "vel_segunda": float(seg), "ambiguo": bool(seg >= 1.5 and seg >= 0.7 * mejor_v),
+                     "sin_corredor": bool(mejor_v < 1.2)}
+
+
+def seguir_atleta(ruta_video, detector):
+    """Lee el video y devuelve el esqueleto del atleta en cada frame, eligiendo al atleta entre todas las personas.
+    Pasada 1: miniaturas + movimiento de la cámara. Pasada 2: busca a todas las personas (cada pocos frames) y decide
+    quién es el atleta. Pasada 3: sigue al atleta frame a frame. Devuelve None si no encontró a nadie."""
+    video = cv2.VideoCapture(ruta_video)
+    fps = video.get(cv2.CAP_PROP_FPS)
+    ancho_v = int(video.get(cv2.CAP_PROP_FRAME_WIDTH))
+    alto_v = int(video.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    total_frames_video = int(video.get(cv2.CAP_PROP_FRAME_COUNT))
+    fps_m = fps if (fps and fps > 0) else 30.0
+
+    # --- Pasada 1: miniaturas y movimiento de la cámara (sin tapar a nadie) ---
+    miniaturas, camara_global = [], {}
+    previo_g, acum_g, ultimo_dg = None, np.zeros(2), None
+    k = 0
+    while True:
+        ok, frame = video.read()
+        if not ok:
+            break
+        mini = cv2.resize(frame, (MINI_ANCHO, int(alto_v * MINI_ANCHO / ancho_v)), interpolation=cv2.INTER_AREA)
+        miniaturas.append(cv2.imencode(".jpg", mini, [cv2.IMWRITE_JPEG_QUALITY, 85])[1].tobytes())
+        gris = cv2.resize(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), None, fx=REDUCCION_FONDO, fy=REDUCCION_FONDO)
+        if previo_g is not None:
+            d = mov_fondo(previo_g, gris, None, ultimo_dg)
+            if d is not None:
+                ultimo_dg = d
+            if ultimo_dg is not None:           # si falla, se repite el último movimiento conocido
+                acum_g = acum_g + ultimo_dg / REDUCCION_FONDO
+        camara_global[k] = acum_g.copy()
+        previo_g = gris
+        k += 1
+    video.release()
+    n_frames = k
+    if n_frames < 3:
+        return None
+
+    # --- Pasada 2: todas las personas, cada pocos frames, y elección del atleta ---
+    paso = max(1, int(round(fps_m / FPS_MUESTREO)))
+    detecciones = {}
+    video = cv2.VideoCapture(ruta_video)
+    k = 0
+    while True:
+        ok, frame = video.read()
+        if not ok:
+            break
+        if k % paso == 0:
+            detecciones[k] = detectar_personas_en_teselas(detector, cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), TAM_RECORTE)
+        k += 1
+    video.release()
+    pistas = construir_pistas(detecciones, camara_global, fps_m)
+    idx_pista, identidad = elegir_pista_atleta(pistas, fps_m)
+    if idx_pista is None:
+        return None
+    identidad["n_personas"] = int(max((len(v) for v in detecciones.values()), default=0))
+
+    # --- Pasada 3: seguimiento frame a frame de la persona elegida ---
+    pista = pistas[idx_pista]
+    ancla = {int(f): (x, y) for f, x, y in zip(pista["f"], pista["x"], pista["y"])}
+    f_ini = max(0, int(pista["f"][0]) - paso)
+    max_salto = max(160.0, 0.9 * float(np.median(pista["h"])))
+    mundo_ult = (pista["x"][0], pista["y"][0])
+    puntos = {}
+    video = cv2.VideoCapture(ruta_video)
+    k = 0
+    while k < n_frames:
+        ok, frame = video.read()
+        if not ok:
+            break
+        if k >= f_ini:
+            cam = camara_global[k]
+            mx, my = ancla.get(k, mundo_ult)
+            ex, ey = mx + cam[0], my + cam[1]       # dónde debería estar el atleta en este frame
+            recorte, x0, y0, tw, th = recorte_centrado(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), ex, ey, TAM_RECORTE)
+            res = detector.detect(mp.Image(image_format=mp.ImageFormat.SRGB, data=recorte))
+            mejor, mejor_d, c_mejor = None, None, None
+            for lm in (res.pose_landmarks or []):
+                pts = np.array([[p.x * tw + x0, p.y * th + y0] for p in lm])
+                c = pts[list(IDX_TORSO)].mean(axis=0)
+                dist = float(np.hypot(c[0] - ex, c[1] - ey))
+                if mejor_d is None or dist < mejor_d:
+                    mejor, mejor_d, c_mejor = pts, dist, c
+            if mejor is not None and mejor_d <= max_salto:
+                puntos[k] = mejor
+                mundo_ult = (float(c_mejor[0] - cam[0]), float(c_mejor[1] - cam[1]))
+        k += 1
+    video.release()
+    if not puntos:
+        return None
+    return {"puntos": puntos, "miniaturas": miniaturas, "camara_global": camara_global, "fps": fps,
+            "ancho_v": ancho_v, "alto_v": alto_v, "total_frames_video": total_frames_video,
+            "n_frames": n_frames, "pistas": pistas, "idx_pista": int(idx_pista), "identidad": identidad}
+
+def cargar_fuente(tam):
+    rutas = [os.path.join(matplotlib.get_data_path(), "fonts", "ttf", "DejaVuSans-Bold.ttf"),
+             "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"]
+    for ruta in rutas:
+        try:
+            return ImageFont.truetype(ruta, tam)
+        except Exception:
+            pass
+    return ImageFont.load_default()
+
+def medir(d, texto, fuente):
+    izq, arr, der, aba = d.textbbox((0, 0), texto, font=fuente)
+    p = int(getattr(fuente, "size", 14) * 0.3)
+    return der - izq + 2 * p, aba - arr + 2 * p, p, izq, arr
+
+def pastilla(d, x, y, texto, fuente):
+    w, h, p, izq, arr = medir(d, texto, fuente)
+    d.rounded_rectangle([x, y, x + w, y + h], radius=p, fill=(20, 20, 20, 175))
+    d.text((x + p - izq, y + p - arr), texto, font=fuente, fill=(255, 255, 255, 255))
+
+def etiquetas_apiladas_fijas(d, items, fuente, ancho, sentido):
+    medidas = [medir(d, texto, fuente) for _, texto in items]
+    p_tronco, p_cadera, p_rodilla = items[0][0], items[1][0], items[2][0]
+    h_tr, h_ca, h_ro = medidas[0][1], medidas[1][1], medidas[2][1]
+
+    y_tronco = p_tronco[1] - h_tr / 2
+    y_cadera = max(p_cadera[1] - h_ca / 2, y_tronco + h_tr + 10)
+    y_rodilla = max(p_rodilla[1] - h_ro / 2, y_cadera + h_ca + 10)
+    ys = [y_tronco, y_cadera, y_rodilla]
+
+    posiciones = []
+    for i, (punto, texto) in enumerate(items):
+        w, h = medidas[i][0], medidas[i][1]
+        x = punto[0] - ancho * 0.05 - w if sentido == 1 else punto[0] + ancho * 0.05
+        x = min(max(x, 10), ancho - w - 10)
+        posiciones.append((x, ys[i], w, h))
+
+    for (punto, _), (x, y, w, h) in zip(items, posiciones):
+        borde = x + w if sentido == 1 else x
+        d.line([(borde, y + h / 2), (punto[0], punto[1])], fill=(255, 255, 255, 210), width=max(2, ancho // 400))
+    for (_, texto), (x, y, w, h) in zip(items, posiciones):
+        pastilla(d, int(x), int(y), texto, fuente)
+
+# =====================================================================
+# TIEMPOS REALES, CHEQUEOS DE CONFIANZA Y DATOS DE DEPURACIÓN (FASE A)
+# =====================================================================
+VERSION_APP = "faseD-2"
+MOSTRAR_INTER_RODILLAS = False     # el ángulo inter-rodillas queda apagado por ahora (ponlo en True para encenderlo)
+MINI_ANCHO = 400                   # ancho (px) de las miniaturas guardadas de cada frame
+
+
+def leer_tiempos_video(ruta, n_frames_leidos):
+    """Lee con ffprobe la hora real (en segundos) de cada frame del video.
+    Los celulares (y WhatsApp) suelen guardar videos de velocidad de cuadros VARIABLE: ahí
+    'frame / fps' da tiempos equivocados. Devuelve (tiempos, info); tiempos=None si no se pudo leer."""
+    info = {"verificado": False, "variable": False, "fps_nominal": None, "fps_promedio": None}
+    try:
+        r = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0",
+                            "-show_entries", "frame=best_effort_timestamp_time", "-of", "csv=p=0", ruta],
+                           capture_output=True, text=True, timeout=180)
+        ts = []
+        for linea in r.stdout.splitlines():
+            try:
+                ts.append(float(linea.strip().split(",")[0]))
+            except ValueError:
+                pass
+    except Exception:
+        return None, info
+    ts = np.sort(np.array(ts, dtype=float))
+    if len(ts) != n_frames_leidos or len(ts) < 3 or np.any(np.diff(ts) <= 0):
+        return None, info
+    dt = np.diff(ts)
+    dt_tipico = float(np.median(dt))
+    info.update({
+        "verificado": True,
+        "variable": bool(dt.max() > 1.5 * dt_tipico or dt.std() > 0.10 * dt_tipico),
+        "fps_nominal": 1.0 / dt_tipico,
+        "fps_promedio": (len(ts) - 1) / float(ts[-1] - ts[0]),
+    })
+    return ts - ts[0], info
+
+
+IDX = [25, 26, 27, 28, 29, 30, 31, 32]                 # rodillas, tobillos, talones, puntas (izq, der, izq, der, ...)
+SWP = [26, 25, 28, 27, 30, 29, 32, 31]                 # lo mismo con izquierda y derecha intercambiadas
+
+def _tramos_consecutivos(frames):
+    tramo, tramos = [frames[0]], []
+    for f in frames[1:]:
+        if f == tramo[-1] + 1:
+            tramo.append(f)
+        else:
+            tramos.append(tramo); tramo = [f]
+    tramos.append(tramo)
+    return tramos
+
+def corregir_intercambios_lr(puntos, altura_px, mu=0.01, tope=0.3):
+    """Busca la asignación derecha/izquierda más coherente con el movimiento de las piernas
+    (programación dinámica sobre todo el tramo; prefiere dejar las etiquetas tal como vienen).
+    Devuelve (puntos_corregidos, frames_corregidos)."""
+    nuevos = {f: p.copy() for f, p in puntos.items()}
+    corregidos = []
+    for tramo in _tramos_consecutivos(sorted(puntos)):
+        n = len(tramo)
+        if n < 3:
+            continue
+        X = []
+        for f in tramo:
+            p = puntos[f]; r = p - (p[23] + p[24]) / 2
+            X.append((r[IDX], r[SWP]))                  # (sin intercambiar, intercambiado)
+        def costo(k, a, b, c):
+            pred = 2 * X[k - 1][b] - X[k - 2][a]
+            d = np.linalg.norm(X[k][c] - pred, axis=1) / altura_px
+            return float(np.mean(np.minimum(d, tope))) + mu * c
+        INF = 1e18
+        V = np.full((n, 2, 2), INF); B = np.zeros((n, 2, 2, 2), dtype=int)     # V[k][b][c]
+        for b in (0, 1):
+            for c in (0, 1):
+                d = np.linalg.norm(X[1][c] - X[0][b], axis=1) / altura_px
+                V[1][b][c] = mu * b + float(np.mean(np.minimum(d, tope))) + mu * c
+        for k in range(2, n):
+            for b in (0, 1):
+                for c in (0, 1):
+                    mejor, arg = INF, 0
+                    for a in (0, 1):
+                        v = V[k - 1][a][b] + costo(k, a, b, c)
+                        if v < mejor:
+                            mejor, arg = v, a
+                    V[k][b][c] = mejor; B[k][b][c][0] = arg
+        b, c = np.unravel_index(np.argmin(V[n - 1]), (2, 2))
+        flags = [0] * n; flags[n - 1] = int(c); flags[n - 2] = int(b)
+        for k in range(n - 1, 1, -1):
+            a = B[k][flags[k - 1]][flags[k]][0]; flags[k - 2] = int(a)
+        for f, fl in zip(tramo, flags):
+            if fl:
+                for i, j in zip(IDX, SWP):
+                    nuevos[f][i] = puntos[f][j]
+                corregidos.append(f)
+    return nuevos, corregidos
+
+def interpolar_aislados(puntos, altura_px, umbral=0.10):
+    """Frames sueltos donde las piernas 'colapsan' (se alejan del punto medio entre el anterior y el siguiente)."""
+    nuevos = {f: p.copy() for f, p in puntos.items()}
+    interpolados = []
+    for f in sorted(puntos):
+        if (f - 1) not in puntos or (f + 1) not in puntos:
+            continue
+        r0, ra, rb = (puntos[g] - (puntos[g][23] + puntos[g][24]) / 2 for g in (f, f - 1, f + 1))
+        desv = np.mean([np.linalg.norm(r0[i] - (ra[i] + rb[i]) / 2) for i in IDX])
+        entre = np.mean([np.linalg.norm(ra[i] - rb[i]) for i in IDX])
+        if desv > umbral * altura_px and entre < 0.5 * desv:
+            hip = (puntos[f][23] + puntos[f][24]) / 2
+            for i in IDX:
+                nuevos[f][i] = hip + (ra[i] + rb[i]) / 2
+            interpolados.append(f)
+    return nuevos, interpolados
+
+
+def pierna_apoyada_en_batida(puntos, f_apoyo, f_despegue, altura_px):
+    """Según la IA, ¿qué pierna está en el suelo durante la batida? (la que tiene el pie más bajo)"""
+    votos_d = votos_i = 0
+    for f in range(f_apoyo, f_despegue + 1):
+        if f not in puntos:
+            continue
+        y_d = puntos[f][[28, 30, 32], 1].max()
+        y_i = puntos[f][[27, 29, 31], 1].max()
+        if y_d > y_i + 0.01 * altura_px:
+            votos_d += 1
+        elif y_i > y_d + 0.01 * altura_px:
+            votos_i += 1
+    total = votos_d + votos_i
+    if total < 3:
+        return None
+    if votos_d >= 0.65 * total:
+        return "Derecha"
+    if votos_i >= 0.65 * total:
+        return "Izquierda"
+    return None
+
+
+def evaluar_confianza(m):
+    """Revisa si los datos medidos son creíbles. 'm' es un diccionario con lo medido.
+    Devuelve el nivel (alta/media/baja), la lista de chequeos y las métricas imposibles."""
+    checks, imposibles = [], set()
+    bloquea = {"todo": False, "angulos": False}      # qué hay que ocultar si algo sale muy mal
+
+    def agregar(estado, titulo, detalle, grupo="todo"):
+        checks.append((estado, titulo, detalle))
+        if estado == "malo":
+            bloquea[grupo] = True
+
+    # --- tiempos del video ---
+    it = m.get("info_tiempos") or {}
+    if not it.get("verificado"):
+        agregar("aviso", "Tiempos del video", "No se pudo leer la hora de cada frame; se asume velocidad de cuadros constante.")
+    elif it.get("variable"):
+        agregar("ok", "Tiempos del video",
+                f"Velocidad de cuadros variable (promedio {it['fps_promedio']:.1f} fps, típica {it['fps_nominal']:.1f}). Se usó la hora real de cada frame.")
+    else:
+        agregar("ok", "Tiempos del video", f"Velocidad de cuadros constante ({it['fps_nominal']:.1f} fps).")
+
+    # --- seguimiento ---
+    cob = m["cobertura_pct"]
+    if cob < 80:
+        agregar("malo", "Seguimiento del atleta", f"La IA solo detectó al atleta en el {cob:.0f}% de los frames del salto.")
+    elif cob < 95:
+        agregar("aviso", "Seguimiento del atleta", f"Detección en el {cob:.0f}% de los frames del salto (ideal ≥ 95%).")
+    else:
+        agregar("ok", "Seguimiento del atleta", f"Detección en el {cob:.0f}% de los frames del salto.")
+
+    # --- tamaño del atleta en el cuadro ---
+    r = m.get("altura_rel")
+    if r is not None:
+        if r < 0.06:
+            agregar("malo", "Tamaño del atleta", f"El atleta mide solo el {r*100:.0f}% del alto del cuadro: graba más cerca (ideal ≥ 10%).")
+        elif r < 0.08:
+            agregar("aviso", "Tamaño del atleta", f"El atleta mide el {r*100:.0f}% del alto del cuadro; con más cerca sería más preciso.")
+        else:
+            agregar("ok", "Tamaño del atleta", f"El atleta mide el {r*100:.0f}% del alto del cuadro.")
+
+    # --- valores físicamente posibles ---
+    def rango(clave, titulo, valor, unidad, malo, aviso, fmt="{:.2f}"):
+        v = fmt.format(valor)
+        if not (malo[0] <= valor <= malo[1]):
+            imposibles.add(clave)
+            agregar("malo", titulo, f"{v} {unidad} no es físicamente posible para un salto (esperado entre {aviso[0]} y {aviso[1]}).")
+        elif not (aviso[0] <= valor <= aviso[1]):
+            agregar("aviso", titulo, f"{v} {unidad} es poco habitual (esperado entre {aviso[0]} y {aviso[1]}).")
+        else:
+            agregar("ok", titulo, f"{v} {unidad}.")
+
+    rango("velocidad", "Velocidad de salida", m["v0"], "m/s", (2.5, 13.0), (4.0, 11.5))
+    rango("angulo", "Ángulo de salida", m["ang_salida"], "°", (-5.0, 60.0), (8.0, 40.0), "{:.1f}")
+    rango("vuelo", "Tiempo de vuelo", m["t_vuelo"], "s", (0.15, 2.5), (0.3, 1.4))
+    rango("contacto", "Tiempo de contacto", m["t_contacto"], "ms", (30.0, 500.0), (60.0, 300.0), "{:.0f}")
+    if m.get("avance") is not None:
+        rango("avance", "Avance en vuelo", m["avance"], "m", (0.3, 12.0), (0.8, 10.0))
+
+    # --- errores de la IA con las piernas y pierna de batida ---
+    er = m.get("errores_piernas") or []
+    if len(er) > 3:
+        agregar("malo", "Piernas izquierda/derecha",
+                f"La IA se equivocó con las piernas en {len(er)} frames de la batida ({', '.join(str(x) for x in er[:6])}...): los ángulos de pierna no son fiables.", "angulos")
+    elif er:
+        agregar("aviso", "Piernas izquierda/derecha",
+                f"La IA intercambió derecha/izquierda o juntó las piernas en los frames {', '.join(str(x) for x in er)}; se corrigió automáticamente, pero revisa los ángulos de esa zona.")
+    else:
+        agregar("ok", "Piernas izquierda/derecha", "No hubo errores de piernas durante la batida.")
+
+    ap, sel = m.get("pierna_apoyada"), m.get("pierna_seleccionada")
+    if ap is not None and sel is not None and ap != sel:
+        agregar("malo", "Pierna de batida",
+                f"Según la IA, la pierna apoyada en el suelo durante la batida es la {ap}, pero está seleccionada la {sel}. "
+                f"Cámbiala en 'Ajuste Fino Manual'.", "angulos")
+    elif ap is not None:
+        agregar("ok", "Pierna de batida", f"La pierna {sel} es la que está apoyada durante la batida.")
+    else:
+        agregar("aviso", "Pierna de batida", "No se pudo comprobar qué pierna está apoyada durante la batida.")
+
+    # --- chequeos de apoyo (más suaves) ---
+    g = m.get("gravedad")
+    if g is not None:
+        if g < 4.0 or g > 16.0:
+            agregar("aviso", "Validación física (gravedad)", f"Gravedad estimada {g:.1f} m/s² (esperado cerca de 9.8): la trayectoria es poco confiable.")
+        else:
+            agregar("ok", "Validación física (gravedad)", f"Gravedad estimada {g:.1f} m/s².")
+    cv = m.get("cv_pierna")
+    if cv is not None:
+        if cv > 20:
+            agregar("aviso", "Escala / perspectiva", f"El largo de la pierna varía ±{cv:.0f}% (cámara oblicua o esqueleto inestable).")
+        else:
+            agregar("ok", "Escala / perspectiva", f"El largo de la pierna varía ±{cv:.1f}%.")
+    if m.get("aviso_tracking"):
+        agregar("aviso", "Fin del seguimiento", "El aterrizaje quedó pegado al último frame con seguimiento: revísalo.")
+
+    # --- identidad del atleta y cámara (Fase C) ---
+    idn = m.get("identidad")
+    if idn:
+        if idn.get("sin_corredor"):
+            agregar("aviso", "Identidad del atleta", "No se vio a nadie desplazándose con claridad: confirma que el esqueleto sea el del atleta.")
+        elif idn.get("ambiguo"):
+            agregar("aviso", "Identidad del atleta",
+                    f"Otra persona se movía casi igual de rápido ({idn.get('n_personas', '?')} personas detectadas): confirma que el esqueleto sea el del atleta.")
+        else:
+            agregar("ok", "Identidad del atleta", f"Se siguió a la persona que más se desplazó ({idn.get('n_personas', 1)} detectadas en el video).")
+    fc = m.get("fallos_camara_pct")
+    if fc is not None:
+        if fc > 35:
+            agregar("malo", "Movimiento de la cámara", f"No se pudo medir el movimiento de la cámara en el {fc:.0f}% de los frames: velocidad y ángulo no son fiables.")
+        elif fc > 10:
+            agregar("aviso", "Movimiento de la cámara", f"No se pudo medir el movimiento de la cámara en el {fc:.0f}% de los frames (ideal < 10%).")
+        else:
+            agregar("ok", "Movimiento de la cámara", "El movimiento de la cámara se midió en casi todos los frames.")
+
+    if any(c[0] == "malo" for c in checks):
+        nivel = "baja"
+    elif any(c[0] == "aviso" for c in checks):
+        nivel = "media"
+    else:
+        nivel = "alta"
+    return {"nivel": nivel, "checks": checks, "imposibles": imposibles,
+            "bloquea_todo": bloquea["todo"], "bloquea_angulos": bloquea["angulos"]}
+
+
+def obtener_miniatura_frame(miniaturas, num_frame, pts_dict, pierna_batida, ancho_v):
+    """Miniatura de un frame, tomada de las imágenes guardadas al leer el video EN ORDEN
+    (antes se 'saltaba' al frame y podía mostrarse otro distinto)."""
+    if not miniaturas or num_frame < 0 or num_frame >= len(miniaturas):
+        return None
+    img = cv2.imdecode(np.frombuffer(miniaturas[num_frame], np.uint8), cv2.IMREAD_COLOR)
+    if img is None:
+        return None
+    if pts_dict and num_frame in pts_dict:
+        p = pts_dict[num_frame] * (img.shape[1] / ancho_v)
+        grosor = 2
+        p_ap = [(24, 26), (26, 28), (28, 30), (30, 32), (28, 32)] if pierna_batida == "Derecha" else [(23, 25), (25, 27), (27, 29), (29, 31), (27, 31)]
+        p_li = [(23, 25), (25, 27), (27, 29), (29, 31), (27, 31)] if pierna_batida == "Derecha" else [(24, 26), (26, 28), (28, 30), (30, 32), (28, 32)]
+        for conexiones, color in ((CUERPO, VERDE), (p_li, NARANJA), (p_ap, AZUL)):
+            for a, b in conexiones:
+                cv2.line(img, tuple(p[a].astype(int)), tuple(p[b].astype(int)), color, grosor, cv2.LINE_AA)
+    return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+
+def armar_datos_depuracion(ds, nombre_video, estatura_m, fases_usadas, resultados):
+    """Junta lo que la IA extrajo del video en un JSON, para poder probar mejoras sin volver a subir el video."""
+    redondear = lambda a, n: np.round(np.asarray(a, dtype=float), n).tolist()
+    datos = {
+        "version_app": VERSION_APP,
+        "video": nombre_video,
+        "ancho": ds["ancho_v"], "alto": ds["alto_v"],
+        "fps_nominal": float(ds["fps"]), "fps_opencv": float(ds.get("fps_cv2", ds["fps"])),
+        "estatura_m": float(estatura_m),
+        "tiempos_s": redondear(ds["tiempos"], 5),
+        "info_tiempos": {k: (None if v is None else (bool(v) if isinstance(v, (bool, np.bool_)) else float(v)))
+                         for k, v in (ds.get("info_tiempos") or {}).items()},
+        "f_min": int(ds["f_min"]), "f_max": int(ds["f_max"]),
+        "fases_auto": {"apoyo": int(ds["f_ap_auto"]), "despegue": int(ds["f_de_auto"]),
+                       "aterrizaje": int(ds["f_at_auto"]), "pierna": ds["pierna_auto"]},
+        "fases_usadas": fases_usadas,
+        "resultados": resultados,
+        "frames_corregidos": [int(x) for x in ds.get("frames_corregidos", [])],
+        "frames_interpolados": [int(x) for x in ds.get("frames_interpolados", [])],
+        "puntos_crudos": {str(f): redondear(p, 1) for f, p in (ds.get("puntos_crudos") or ds["puntos"]).items()},
+        "puntos": {str(f): redondear(p, 1) for f, p in ds["puntos"].items()},
+        "camara_raw": {str(f): redondear(v, 2) for f, v in ds["camara_raw"].items()},
+        "camara_global": {str(f): redondear(v, 2) for f, v in (ds.get("camara_global") or {}).items()},
+        "pistas": [{"f": [int(x) for x in p["f"]], "x": redondear(p["x"], 1), "y": redondear(p["y"], 1), "h": redondear(p["h"], 1)}
+                   for p in (ds.get("pistas") or [])],
+        "idx_pista": ds.get("idx_pista"),
+        "identidad": ds.get("identidad"),
+        "fallos_camara_pct": ds.get("fallos_camara_pct"),
+    }
+    return json.dumps(datos, ensure_ascii=False)
+
+# =====================================================================
+# DETECCIÓN DE FASES Y PIERNA DE BATIDA (FORZANDO DERECHA POR DEFECTO)
+# =====================================================================
+def detectar_fases_y_pierna_auto(puntos, camara_raw, fps, frames_dudosos=()):
+    frames = sorted(set(puntos.keys()) & set(camara_raw.keys()))
+    if len(frames) < 15:
+        f_mid = frames[len(frames) // 2] if frames else 10
+        return f_mid, f_mid + 6, f_mid + 25, "Derecha"
+
+    # 1) Pie más bajo de cada frame (corregido por la cámara) y su posición horizontal
+    def pie_bajo(f):
+        p = puntos[f]
+        y_d = max(p[TOBILLO_D][1], p[TALON_D][1], p[PUNTA_D][1])
+        y_i = max(p[TOBILLO_I][1], p[TALON_I][1], p[PUNTA_I][1])
+        return max(y_d, y_i) - camara_raw[f][1]
+
+    def x_pie_bajo(f):
+        p = puntos[f]
+        lado = TOBILLO_D if p[TOBILLO_D][1] >= p[TOBILLO_I][1] else TOBILLO_I
+        return p[lado][0] - camara_raw[f][0]
+
+    # Serie continua: si a la IA le faltó algún frame, se rellena por interpolación
+    # (solo dentro de esta función; el resto de la app no se modifica)
+    todos = np.arange(frames[0], frames[-1] + 1)
+    y_crudo = np.interp(todos, frames, [pie_bajo(f) for f in frames])
+    x_pie = np.interp(todos, frames, [x_pie_bajo(f) for f in frames])
+    y_pie = suavizar_serie(y_crudo, 3)
+    n = len(todos)
+    dudosos = set(int(x) for x in frames_dudosos)      # frames donde la IA se equivocó y se corrigió
+
+    # 2) Tolerancias proporcionales al tamaño del atleta en pantalla (no en píxeles fijos)
+    altura_px = float(np.median([pie_bajo(f) - (puntos[f][NARIZ][1] - camara_raw[f][1]) for f in frames]))
+    tol = 0.03 * altura_px             # "pie en el suelo" (~4 cm)
+    tol_despegue = 0.06 * altura_px    # "pie claramente despegado" (~8 cm)
+    v_llegada = 0.02 * altura_px       # velocidad (por frame) con que el pie aún "está llegando"
+
+    # 3) Primera pasada: el vuelo del salto = tramo MÁS LARGO sin contacto con el suelo
+    y_suelo = float(np.percentile(y_pie, 90))
+    en_suelo = y_pie >= (y_suelo - tol)
+    for i in range(1, n - 1):                      # quitar "parpadeos" de 1 frame
+        if en_suelo[i - 1] == en_suelo[i + 1] and en_suelo[i] != en_suelo[i - 1]:
+            en_suelo[i] = en_suelo[i - 1]
+
+    mejor_ini, mejor_largo = None, 0
+    i = 0
+    while i < n:
+        if not en_suelo[i]:
+            j = i
+            while j < n and not en_suelo[j]:
+                j += 1
+            if j - i > mejor_largo:
+                mejor_ini, mejor_largo = i, j - i
+            i = j
+        else:
+            i += 1
+
+    if mejor_ini is None or mejor_largo < int(0.2 * fps):      # vuelo menor a 0.2 s: no es un salto
+        f_mid = int(todos[n // 2])
+        return f_mid, f_mid + 6, f_mid + 25, "Derecha"
+
+    i_despegue = max(0, mejor_ini - 1)                 # último contacto (aproximado)
+    i_fin_vuelo = min(n - 1, mejor_ini + mejor_largo)  # primer contacto con el suelo (aproximado)
+
+    i_apoyo = i_despegue                               # inicio del bloque de contacto (aproximado)
+    x_ref = x_pie[i_despegue]
+    while i_apoyo > 0 and en_suelo[i_apoyo - 1] and abs(x_pie[i_apoyo - 1] - x_ref) <= 0.25 * altura_px:
+        i_apoyo -= 1
+
+    # 4) Afinar apoyo y despegue con el suelo LOCAL de la batida y los datos sin suavizar
+    #    (el suavizado "reparte" los cambios bruscos y corre los bordes 1-2 frames)
+    ini_nuc, fin_nuc = i_apoyo + 2, i_despegue - 2
+    if fin_nuc < ini_nuc:
+        ini_nuc, fin_nuc = i_apoyo, i_despegue
+    y_local = float(np.median(y_crudo[ini_nuc:fin_nuc + 1]))
+    x_batida = float(np.median(x_pie[ini_nuc:fin_nuc + 1]))
+
+    # despegue = primer frame en que el pie queda claramente levantado (2 frames seguidos,
+    # para que un solo frame con ruido no lo adelante)
+    k = fin_nuc
+    while k < n - 2 and not ((y_local - y_crudo[k]) > tol_despegue and (y_local - y_crudo[k + 1]) > tol_despegue):
+        k += 1
+    i_despegue = k
+
+    # apoyo = el pie ya está en el suelo local, en el mismo lugar, y deja de bajar
+    def en_contacto(i):
+        return (y_local - y_crudo[i]) <= tol and abs(x_pie[i] - x_batida) <= 0.25 * altura_px
+
+    k = ini_nuc
+    while k > 0:
+        if en_contacto(k - 1):
+            k -= 1
+            continue
+        # frames con datos dudosos (intercambios o colapsos corregidos): se pasan por encima (hasta 2)
+        saltar = 0
+        while saltar < 2 and k - 1 - saltar >= 0 and int(todos[k - 1 - saltar]) in dudosos:
+            saltar += 1
+        if saltar and k - 1 - saltar >= 0 and en_contacto(k - 1 - saltar):
+            k -= saltar + 1
+        else:
+            break
+    while k < ini_nuc and (y_crudo[k] - y_crudo[k - 1]) > v_llegada:   # el pie todavía está llegando
+        k += 1
+    i_apoyo = k
+
+    # 5) Aterrizaje: el pie llega al punto más bajo que alcanza después del vuelo.
+    #    No se compara con el suelo de la carrera, porque la arena puede quedar a otra altura
+    #    en la imagen (en tu video quedaba ~13 cm más arriba).
+    a = min(i_despegue, n - 1)
+    b = max(i_fin_vuelo, a + 1)
+    i_pico = a + int(np.argmin(y_pie[a:b + 1]))                                # pie en su punto más alto
+    fin_ventana = min(n, i_pico + int(0.75 * fps))
+    resto = y_pie[i_pico:fin_ventana]
+    y_bajo = float(np.max(resto))                                              # punto más bajo tras el vuelo
+    i_aterrizaje = i_pico + int(np.argmax(resto >= y_bajo - tol))
+    i_aterrizaje = min(i_aterrizaje, max(i_fin_vuelo, i_pico + 1))
+    # Control: un pie que aterriza tiene que haber bajado al menos el 40% desde lo más alto del vuelo.
+    # Si no, el seguimiento terminó antes del aterrizaje: se devuelve el último frame disponible.
+    altura_pico = y_local - y_pie[i_pico]
+    altura_aterr = y_local - y_pie[min(i_aterrizaje, n - 1)]
+    if altura_pico <= 0 or (altura_pico - altura_aterr) < 0.4 * altura_pico:
+        i_aterrizaje = n - 1
+
+    # orden lógico: apoyo < despegue < aterrizaje
+    i_despegue = max(i_despegue, i_apoyo + 1)
+    i_aterrizaje = max(i_aterrizaje, i_despegue + 1)
+
+    pierna_auto = "Derecha"   # sigue fija; se puede mejorar después
+    return int(todos[i_apoyo]), int(todos[i_despegue]), int(todos[i_aterrizaje]), pierna_auto
+
+# =====================================================================
+# FUNCIONES DE UI Y SEMÁFOROS
+# =====================================================================
+def calcular_puntaje_semaforo(valor, ideal_min, ideal_max, tolerancia):
+    if valor is None:
+        return None, "#6c757d", "⚪", "Sin datos"
+    if ideal_min <= valor <= ideal_max:
+        puntaje = 100
+    else:
+        distancia = (ideal_min - valor) if valor < ideal_min else (valor - ideal_max)
+        penalizacion = (distancia / tolerancia) * 60
+        puntaje = int(np.clip(round(100 - penalizacion), 1, 99))
+
+    if puntaje >= 80:
+        return puntaje, "#28a745", "🟢", "Óptimo"
+    elif puntaje >= 50:
+        return puntaje, "#ffc107", "🟡", "Aceptable"
+    else:
+        return puntaje, "#dc3545", "🔴", "A mejorar"
+
+def renderizar_tarjeta_semaforo(titulo, valor_txt, meta_txt, puntaje, color_hex, emoji, estado_txt):
+    puntaje_str = f"{puntaje} / 100" if puntaje is not None else "N/D"
+    html = f"""
+    <div style="border-left: 6px solid {color_hex}; background-color: rgba(255,255,255,0.04); padding: 14px 16px; border-radius: 8px; margin-bottom: 10px; border: 1px solid rgba(255,255,255,0.1); border-left-width: 6px;">
+        <div style="font-size: 0.85rem; color: #aaa; margin-bottom: 4px;">{titulo}</div>
+        <div style="font-size: 1.55rem; font-weight: 700; margin-bottom: 6px;">{valor_txt}</div>
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-top: 6px;">
+            <span style="background-color: {color_hex}22; color: {color_hex}; border: 1px solid {color_hex}; padding: 2px 9px; border-radius: 12px; font-weight: 700; font-size: 0.85rem;">
+                {emoji} {puntaje_str} · {estado_txt}
+            </span>
+        </div>
+        <div style="font-size: 0.78rem; color: #888; margin-top: 6px;">{meta_txt}</div>
+    </div>
+    """
+    st.markdown(html, unsafe_allow_html=True)
+
+# =====================================================================
+# RESUMEN "QUÉ MEJORAR" (lenguaje de atleta; el detalle técnico queda más abajo)
+# =====================================================================
+# Rangos ideales: los "Criterios del Entrenador". Los usan tanto los semáforos como este resumen.
+#   ideal    = rango que cuenta como verde (el puntaje dentro del rango va de 85 a 100)
+#   optimo   = valor (o zona, si es una tupla) donde el puntaje es 100
+#   tol      = cuántas unidades fuera del rango bajan el puntaje en 35 puntos (más alto = más permisivo)
+#   orientativo = la medición es demasiado ruidosa para exigir tanto: se muestra, pero no cuenta en el puntaje global
+PARAMETROS_TECNICOS = {
+    "flexion": {
+        "nombre": "Flexión de la rodilla al apoyar", "unidad": "°", "decimales": 0,
+        "ideal": (140.0, 155.0), "optimo": 147.5, "tol": 10.0, "orientativo": False,
+        "bajo": ("La rodilla de la pierna de batida se dobla más de lo ideal al apoyar.",
+                 "Llega a la tabla con la pierna más firme, para no hundirte ni perder velocidad."),
+        "alto": ("La pierna de batida llega casi recta y se flexiona poco al apoyar.",
+                 "Una pequeña flexión ayuda a absorber el impacto; evita bloquear la rodilla por completo."),
+    },
+    "extension": {
+        "nombre": "Extensión de la pierna al despegar", "unidad": "°", "decimales": 0,
+        "ideal": (168.0, 180.0), "optimo": (170.0, 180.0), "tol": 8.0, "orientativo": False,   # de 170° para arriba es 100
+        "bajo": ("La pierna de batida no termina de extenderse cuando despegas.",
+                 "Empuja hasta estirar cadera, rodilla y tobillo antes de que el pie deje el suelo."),
+        "alto": ("La pierna de batida queda totalmente extendida al despegar.",
+                 "Mantén esa extensión completa."),
+    },
+    "ataque": {
+        "nombre": "Ángulo de la pierna al llegar a la tabla", "unidad": "°", "decimales": 0,
+        "ideal": (55.0, 65.0), "optimo": 60.0, "tol": 8.0, "orientativo": False,
+        "bajo": ("La pierna llega muy tendida hacia adelante: el pie cae lejos del cuerpo.",
+                 "Intenta apoyar con el pie más cerca de la vertical de la cadera, para no frenarte."),
+        "alto": ("La pierna llega muy vertical, casi justo debajo de la cadera.",
+                 "Puedes adelantar un poco el pie al apoyar, manteniendo la pierna activa."),
+    },
+    "descenso": {
+        "nombre": "Descenso del cuerpo antes de la batida", "unidad": "cm", "decimales": 1,
+        "ideal": (7.0, 8.0), "optimo": 7.5, "tol": 4.0, "orientativo": True,
+        "nota": "La medición tiene unos ±1 cm de ruido (el rango ideal mide 1 cm): tómalo como una guía.",
+        "bajo": ("Casi no bajas el cuerpo en los pasos previos a la batida.",
+                 "Un leve descenso en el penúltimo paso prepara la batida."),
+        "alto": ("Bajas el cuerpo más de lo ideal antes de la batida.",
+                 "Un descenso mayor puede costarte velocidad; intenta mantenerte alto y fluido."),
+    },
+}
+UMBRAL_VERDE, UMBRAL_AMARILLO = 85, 65
+
+
+def calcular_puntaje_semaforo_equilibrado(valor, rango_min, rango_max, valor_optimo, tolerancia):
+    """Puntaje exigente pero justo.
+    - Dentro del rango ideal: de 85 (en el borde) a 100 (en el óptimo). Verde.
+    - Fuera del rango: baja 35 puntos por cada 'tolerancia' de distancia, desde 84. Amarillo o rojo.
+    valor_optimo puede ser un número o una zona (min, max), por ejemplo "170° o más"."""
+    if valor is None:
+        return None, "#6c757d", "⚪", "Sin datos"
+    zlo, zhi = valor_optimo if isinstance(valor_optimo, (tuple, list)) else (valor_optimo, valor_optimo)
+
+    def a_la_zona(x):
+        return max(zlo - x, 0.0, x - zhi)
+
+    if rango_min <= valor <= rango_max:
+        dmax = max(a_la_zona(rango_min), a_la_zona(rango_max))
+        puntaje = 100 if dmax == 0 else int(round(100 - (a_la_zona(valor) / dmax) * 15))
+    else:
+        fuera = (rango_min - valor) if valor < rango_min else (valor - rango_max)
+        puntaje = int(np.clip(round(84 - (fuera / tolerancia) * 35), 1, 84))
+    if puntaje >= UMBRAL_VERDE:
+        return puntaje, "#28a745", "🟢", "Óptimo (Élite)"
+    elif puntaje >= UMBRAL_AMARILLO:
+        return puntaje, "#ffc107", "🟡", "Aceptable"
+    return puntaje, "#dc3545", "🔴", "Crítico / A mejorar"
+
+
+def puntaje_global_tecnico(puntajes):
+    """Puntaje global de la técnica. Es verde solo si TODOS los parámetros están en verde:
+    un promedio alto no puede esconder un parámetro en amarillo o rojo."""
+    validos = [p for p in puntajes if p is not None]
+    if not validos:
+        return 0, "#dc3545", "🔴", "Requiere Corrección Técnica"
+    media = int(round(np.mean(validos)))
+    if min(validos) >= UMBRAL_VERDE:
+        return media, "#28a745", "🟢", "Ejecución Técnica Sobresaliente"
+    if media >= UMBRAL_AMARILLO:
+        return media, "#ffc107", "🟡", "Ejecución Técnica en Desarrollo"
+    return media, "#dc3545", "🔴", "Requiere Corrección Técnica"
+
+
+def puntaje_parametro(clave, valor):
+    c = PARAMETROS_TECNICOS[clave]
+    return calcular_puntaje_semaforo_equilibrado(valor, c["ideal"][0], c["ideal"][1], c["optimo"], c["tol"])
+
+
+def armar_resumen_mejoras(medidas, max_prioridades=3):
+    """medidas: {'flexion': valor, 'extension': valor, 'ataque': valor, 'descenso': valor (o None)}.
+    Devuelve las prioridades (las exactas primero, y de peor a mejor), lo que va bien (verde) y lo que no se pudo medir."""
+    prioridades, bien, sin_datos = [], [], []
+    for clave, cfg in PARAMETROS_TECNICOS.items():
+        v = medidas.get(clave)
+        if v is None:
+            sin_datos.append(cfg["nombre"])
+            continue
+        lo, hi = cfg["ideal"]
+        puntaje = puntaje_parametro(clave, v)[0]
+        lado = "bajo" if v < lo else ("alto" if v > hi else "ok")
+        item = {"clave": clave, "nombre": cfg["nombre"], "valor": float(v), "unidad": cfg["unidad"],
+                "decimales": cfg["decimales"], "ideal": cfg["ideal"], "puntaje": int(puntaje), "lado": lado,
+                "orientativo": bool(cfg["orientativo"]), "nota": cfg.get("nota")}
+        if lado != "ok":
+            item["texto"], item["consejo"] = cfg[lado]
+        (bien if puntaje >= UMBRAL_VERDE else prioridades).append(item)
+    prioridades.sort(key=lambda it: (it["orientativo"], it["puntaje"]))
+    return {"prioridades": prioridades[:max_prioridades], "n_extra": max(0, len(prioridades) - max_prioridades),
+            "bien": bien, "sin_datos": sin_datos}
+
+
+def _fmt_valor(v, unidad, decimales):
+    txt = f"{v:.{decimales}f}"
+    return f"{txt}{unidad}" if unidad == "°" else f"{txt} {unidad}"
+
+
+def html_resumen_mejoras(resumen, nivel_confianza="alta", forzado=False):
+    """Tarjetas del resumen (HTML). Los fondos son translúcidos para que se vean bien en tema claro y oscuro."""
+    partes = ['<div style="margin: 4px 0 18px 0;">',
+              '<div style="font-size:1.3rem;font-weight:800;margin-bottom:10px;">🎯 Qué mejorar en este salto</div>']
+    pr, bien = resumen["prioridades"], resumen["bien"]
+    if not pr and bien:
+        partes.append('<div style="border:1px solid #28a745;border-left:6px solid #28a745;border-radius:10px;padding:12px 14px;'
+                      'background:rgba(40,167,69,0.10);font-weight:600;">✅ ¡Buen salto! Todos los parámetros técnicos medidos '
+                      'están dentro del rango ideal.</div>')
+    elif not pr:
+        partes.append('<div style="opacity:0.8;">No hay datos suficientes para recomendar mejoras en este salto.</div>')
+    for i, it in enumerate(pr, 1):
+        color = "#dc3545" if it["puntaje"] < UMBRAL_AMARILLO else "#ffc107"
+        lo, hi = it["ideal"]
+        ideal = f"{_fmt_valor(lo, it['unidad'], it['decimales'])} – {_fmt_valor(hi, it['unidad'], it['decimales'])}"
+        etiqueta = ' <span style="font-size:0.8rem;font-weight:400;opacity:0.7;">(orientativo)</span>' if it["orientativo"] else ""
+        nota = f'<div style="font-size:0.85rem;opacity:0.7;margin-top:6px;">ℹ️ {it["nota"]}</div>' if it.get("nota") else ""
+        partes.append(
+            f'<div style="display:flex;gap:12px;align-items:flex-start;border:1px solid rgba(128,128,128,0.35);'
+            f'border-left:6px solid {color};border-radius:10px;padding:12px 14px;margin-bottom:10px;background:rgba(128,128,128,0.08);">'
+            f'<div style="min-width:30px;height:30px;border-radius:50%;background:{color};color:#111;font-weight:800;'
+            f'display:flex;align-items:center;justify-content:center;">{i}</div>'
+            f'<div style="flex:1;min-width:0;">'
+            f'<div style="font-weight:700;font-size:1.05rem;">{it["nombre"]}{etiqueta}</div>'
+            f'<div style="font-size:0.9rem;opacity:0.75;margin:2px 0 6px 0;">Tú: <b>{_fmt_valor(it["valor"], it["unidad"], it["decimales"])}</b>'
+            f' · Ideal: {ideal}</div>'
+            f'<div style="font-size:0.95rem;">{it["texto"]}</div>'
+            f'<div style="font-size:0.92rem;margin-top:6px;">💡 {it["consejo"]}</div>{nota}'
+            f'</div></div>')
+    if resumen["n_extra"]:
+        partes.append(f'<div style="font-size:0.9rem;opacity:0.8;margin-bottom:8px;">Hay {resumen["n_extra"]} parámetro(s) más '
+                      f'por mejorar en el detalle técnico de abajo.</div>')
+    if bien and pr:
+        chips = " ".join(f'<span style="display:inline-block;border:1px solid #28a745;background:rgba(40,167,69,0.10);'
+                         f'border-radius:12px;padding:2px 10px;margin:2px 4px 2px 0;font-size:0.88rem;">'
+                         f'{b["nombre"]} ({_fmt_valor(b["valor"], b["unidad"], b["decimales"])})</span>' for b in bien)
+        partes.append(f'<div style="margin-top:4px;"><b>✅ Va bien:</b> {chips}</div>')
+    if resumen["sin_datos"]:
+        partes.append(f'<div style="font-size:0.85rem;opacity:0.7;margin-top:6px;">No se pudo medir: {", ".join(resumen["sin_datos"])}.</div>')
+    if forzado:
+        partes.append('<div style="font-size:0.88rem;margin-top:8px;color:#dc3545;">🔴 Los datos de este análisis no son fiables: '
+                      'no tomes estas indicaciones como definitivas.</div>')
+    elif nivel_confianza == "media":
+        partes.append('<div style="font-size:0.88rem;margin-top:8px;color:#ffc107;">🟡 La confianza de los datos es media: '
+                      'revisa los avisos antes de fiarte de estas indicaciones.</div>')
+    partes.append('<div style="font-size:0.8rem;opacity:0.6;margin-top:8px;">Orientación basada en los rangos de tu entrenador. '
+                  'Confirma cualquier cambio de técnica con él.</div>')
+    partes.append('</div>')
+    return "".join(partes)
+
+
+# =====================================================================
+# BARRA LATERAL
+# =====================================================================
+with st.sidebar:
+    st.header("⚙️ Configuración Universal")
+    estatura_m = st.number_input("Estatura real del atleta (m)", min_value=1.20, max_value=2.30, value=1.69, step=0.01)
+    velocidad_video = st.select_slider("Velocidad de reproducción del video", options=[0.1, 0.25, 0.5, 1.0], value=0.25)
+
+# =====================================================================
+# CARGA Y PROCESAMIENTO
+# =====================================================================
+with st.expander("🎥 Cómo grabar para mejores resultados", expanded=False):
+    st.markdown("""
+- **De lado** al atleta (cámara perpendicular a la carrera), en vertical o apaisado, sin zoom ni cortes.
+- **Atleta completo** en el cuadro durante batida y vuelo, midiendo al menos un 10 % del alto del cuadro.
+- **60 fps** o más, buena luz y sin contraluz.
+- **Cámara fija o paneo suave**; si hay público, que quede lejos de la zona de batida.
+- **Un solo salto por video.**
+""")
+
+archivo_subido = st.file_uploader("Sube tu video de salto (.mp4, .mov)", type=["mp4", "mov", "avi"])
+
+if archivo_subido is not None:
+    if st.session_state.video_id != archivo_subido.name:
+        tfile = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+        tfile.write(archivo_subido.read())
+        st.session_state.ruta_video = tfile.name
+        st.session_state.video_id = archivo_subido.name
+        st.session_state.datos_salto = None
+
+    ruta_video = st.session_state.ruta_video
+
+    if st.button("🚀 Analizar Salto Universalmente", type="primary"):
+        modelo_path = asegurar_modelo()
+
+        with st.spinner("Procesando fotogramas y aplicando motor universal de IA..."):
+            opciones = mp.tasks.vision.PoseLandmarkerOptions(
+                base_options=mp.tasks.BaseOptions(model_asset_path=modelo_path),
+                running_mode=mp.tasks.vision.RunningMode.IMAGE,
+                num_poses=MAX_PERSONAS
+            )
+            with mp.tasks.vision.PoseLandmarker.create_from_options(opciones) as detector:
+                det = seguir_atleta(ruta_video, detector)
+            if det is None:
+                st.error("❌ No se pudo detectar al atleta en el video.")
+                st.stop()
+            puntos, miniaturas = det["puntos"], det["miniaturas"]
+            fps, ancho_v, alto_v = det["fps"], det["ancho_v"], det["alto_v"]
+            total_frames_video, k = det["total_frames_video"], det["n_frames"]
+            camara_global, identidad = det["camara_global"], det["identidad"]
+
+            # Hora real de cada frame (en videos de velocidad variable, frame/fps da tiempos equivocados)
+            fps_cv2 = fps
+            tiempos, info_t = leer_tiempos_video(ruta_video, k)
+            if tiempos is None:
+                fps = fps_cv2 if fps_cv2 and fps_cv2 > 0 else 30.0
+                tiempos = np.arange(k) / fps
+                info_t = {"verificado": False, "variable": False, "fps_nominal": fps, "fps_promedio": fps}
+            else:
+                fps = info_t["fps_nominal"]
+
+            if not puntos:
+                st.error("❌ No se pudo detectar al atleta en el video.")
+                st.stop()
+
+            # Reparar errores de la IA en las piernas (intercambios derecha/izquierda y frames donde se 'juntan')
+            puntos_crudos = puntos
+            altura_est = float(np.median([p[PIES, 1].max() - p[NARIZ, 1] for p in puntos_crudos.values()]))
+            puntos, frames_corregidos = corregir_intercambios_lr(puntos_crudos, altura_est)
+            puntos, frames_interpolados = interpolar_aislados(puntos, altura_est)
+
+            f_min, f_max = min(puntos.keys()), max(puntos.keys())
+
+            cap = cv2.VideoCapture(ruta_video)
+            for _ in range(f_min):      # se avanza leyendo en orden (saltar a un frame puede dejarte en otro)
+                cap.grab()
+
+            def leer_gris():
+                ok, img = cap.read()
+                return cv2.resize(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY), None, fx=REDUCCION_FONDO, fy=REDUCCION_FONDO) if ok else None
+
+            previo = leer_gris()
+            acumulado = np.zeros(2)
+            camara_raw = {f_min: acumulado.copy()}
+            pose_ref = puntos[f_min]            # última pose conocida (sirve para tapar al atleta en la máscara)
+            ultimo_d = None                     # último movimiento de cámara medido
+            fallos, frames_cam = 0, 0
+            for f in range(f_min + 1, f_max + 1):
+                actual = leer_gris()
+                if actual is None:
+                    break
+                if (f - 1) in puntos:
+                    pose_ref = puntos[f - 1]
+                d = mov_fondo(previo, actual, mascara_sin_atleta(previo.shape, pose_ref * REDUCCION_FONDO), ultimo_d)
+                frames_cam += 1
+                if d is None:
+                    # no se pudo medir con el atleta tapado: se usa la medición global (sin tapar a nadie)
+                    fallos += 1
+                    acumulado = acumulado + (camara_global[f] - camara_global[f - 1])
+                else:
+                    ultimo_d = d
+                    acumulado = acumulado + d / REDUCCION_FONDO
+                camara_raw[f] = acumulado.copy()
+                previo = actual
+            cap.release()
+            fallos_camara_pct = 100.0 * fallos / max(1, frames_cam)
+
+            try:
+                f_ap_auto, f_de_auto, f_at_auto, pierna_auto = detectar_fases_y_pierna_auto(
+                    puntos, camara_raw, fps, sorted(set(frames_corregidos) | set(frames_interpolados)))
+            except Exception:
+                f_mid = (f_min + f_max) // 2
+                f_ap_auto, f_de_auto, f_at_auto, pierna_auto = f_mid, f_mid + 6, f_mid + 25, "Derecha"
+
+            # Pierna de batida: la que, según la IA, está apoyada en el suelo durante la batida
+            if altura_est > 0:
+                _pierna_evidencia = pierna_apoyada_en_batida(puntos, f_ap_auto, f_de_auto, altura_est)
+                if _pierna_evidencia:
+                    pierna_auto = _pierna_evidencia
+
+            ultimo_cam = max(camara_raw.keys())
+            aviso_tracking = None
+            if f_at_auto >= ultimo_cam - 1 or ultimo_cam < f_max - int(0.1 * fps):
+                aviso_tracking = (f"⚠️ El seguimiento de la cámara terminó en el frame {ultimo_cam} "
+                                  f"(hay detecciones del atleta hasta el {f_max}). "
+                                  "Revisa el aterrizaje y ajústalo con los controles manuales.")
+
+            aviso_identidad = None
+            if identidad.get("sin_corredor"):
+                aviso_identidad = "⚠️ No se vio a nadie desplazándose con claridad en el video: revisa que el esqueleto sea el del atleta."
+            elif identidad.get("ambiguo"):
+                aviso_identidad = (f"⚠️ Había otra persona moviéndose casi igual de rápido ({identidad['n_personas']} personas detectadas). "
+                                   "Revisa en el video anotado que el esqueleto sea el del atleta.")
+
+            st.session_state.datos_salto = {
+                "puntos": puntos,
+                "camara_raw": camara_raw,
+                "fps": fps,
+                "ancho_v": ancho_v,
+                "alto_v": alto_v,
+                "total_frames_video": total_frames_video,
+                "f_min": f_min,
+                "f_max": f_max,
+                "f_ap_auto": f_ap_auto,
+                "f_de_auto": f_de_auto,
+                "f_at_auto": f_at_auto,
+                "pierna_auto": pierna_auto,
+                "aviso_tracking": aviso_tracking,
+                "aviso_identidad": aviso_identidad,
+                "identidad": identidad,
+                "fallos_camara_pct": fallos_camara_pct,
+                "camara_global": camara_global,
+                "pistas": det["pistas"],
+                "idx_pista": det["idx_pista"],
+                "fps_cv2": fps_cv2,
+                "tiempos": tiempos,
+                "info_tiempos": info_t,
+                "miniaturas": miniaturas,
+                "puntos_crudos": puntos_crudos,
+                "frames_corregidos": frames_corregidos,
+                "frames_interpolados": frames_interpolados
+            }
+
+    # =====================================================================
+    # RESULTADOS, DIAGNÓSTICO Y FIABILIDAD
+    # =====================================================================
+    if st.session_state.datos_salto is not None:
+        ds = st.session_state.datos_salto
+        puntos = ds["puntos"]
+        camara_raw = ds["camara_raw"]
+        fps = ds["fps"]
+        ancho_v = ds["ancho_v"]
+        alto_v = ds["alto_v"]
+        total_frames_video = ds["total_frames_video"]
+        f_min, f_max = ds["f_min"], ds["f_max"]
+        tiempos = ds.get("tiempos")
+        if tiempos is None:      # (por si la sesión viene de una versión anterior)
+            tiempos = np.arange(f_max + 1) / fps
+        miniaturas = ds.get("miniaturas") or []
+
+        def t_de(f):
+            """Hora real (s) de un frame."""
+            return float(tiempos[min(max(int(f), 0), len(tiempos) - 1)])
+
+        frame_apoyo = ds["f_ap_auto"]
+        FRAME_DESPEGUE = ds["f_de_auto"]
+        FRAME_ATERRIZAJE = ds["f_at_auto"]
+        pierna_batida = ds["pierna_auto"]
+
+        if ds.get("aviso_identidad"):
+            st.warning(ds["aviso_identidad"])
+        if ds.get("aviso_tracking"):
+            st.warning(ds["aviso_tracking"])
+
+        with st.expander("⚙️ Ajuste Fino Manual (Opcional)", expanded=False):
+            col_opt1, col_opt2, col_opt3, col_opt4 = st.columns(4)
+            with col_opt1:
+                pierna_batida = st.selectbox("Pierna de Batida", ["Derecha", "Izquierda"],
+                                             index=0 if ds["pierna_auto"] == "Derecha" else 1)
+            with col_opt2:
+                frame_apoyo = st.slider("Frame de Apoyo", min_value=f_min, max_value=f_max - 2, value=ds["f_ap_auto"])
+            with col_opt3:
+                FRAME_DESPEGUE = st.slider("Frame de Despegue", min_value=f_min, max_value=f_max - 1, value=ds["f_de_auto"])
+            with col_opt4:
+                FRAME_ATERRIZAJE = st.slider("Frame de Aterrizaje", min_value=f_min, max_value=f_max, value=ds["f_at_auto"])
+
+            vp1, vp2, vp3 = st.columns(3)
+            with vp1:
+                img_ap = obtener_miniatura_frame(miniaturas, frame_apoyo, puntos, pierna_batida, ancho_v)
+                if img_ap is not None:
+                    st.image(img_ap, caption=f"Apoyo (f.{frame_apoyo})", use_container_width=True)
+            with vp2:
+                img_de = obtener_miniatura_frame(miniaturas, FRAME_DESPEGUE, puntos, pierna_batida, ancho_v)
+                if img_de is not None:
+                    st.image(img_de, caption=f"Despegue (f.{FRAME_DESPEGUE})", use_container_width=True)
+            with vp3:
+                img_at = obtener_miniatura_frame(miniaturas, FRAME_ATERRIZAJE, puntos, pierna_batida, ancho_v)
+                if img_at is not None:
+                    st.image(img_at, caption=f"Aterrizaje (f.{FRAME_ATERRIZAJE})", use_container_width=True)
+
+        if frame_apoyo >= FRAME_DESPEGUE:
+            FRAME_DESPEGUE = frame_apoyo + 1
+        if FRAME_DESPEGUE >= FRAME_ATERRIZAJE:
+            FRAME_ATERRIZAJE = FRAME_DESPEGUE + 1
+
+        # ASIGNACIÓN ESTRICTA Y LIMPIA SEGÚN LA PIERNA SELECCIONADA
+        if pierna_batida == "Derecha":
+            CAD_AP, ROD_AP, TOB_AP = CADERA_D, RODILLA_D, TOBILLO_D
+            PIERNA_APOYO = [(24, 26), (26, 28), (28, 30), (30, 32), (28, 32)]
+            PIERNA_LIBRE = [(23, 25), (25, 27), (27, 29), (29, 31), (27, 31)]
+            ROD_LIBRE = RODILLA_I
+            TOB_LIBRE = TOBILLO_I
+        else:
+            CAD_AP, ROD_AP, TOB_AP = CADERA_I, RODILLA_I, TOBILLO_I
+            PIERNA_APOYO = [(23, 25), (25, 27), (27, 29), (29, 31), (27, 31)]
+            PIERNA_LIBRE = [(24, 26), (26, 28), (28, 30), (30, 32), (28, 32)]
+            ROD_LIBRE = RODILLA_D
+            TOB_LIBRE = TOBILLO_D
+
+        # --- CÁLCULOS BIOMECÁNICOS ---
+        largos_pierna = [np.linalg.norm(puntos[f][c] - puntos[f][r]) + np.linalg.norm(puntos[f][r] - puntos[f][t])
+                         for f in range(frame_apoyo, min(frame_apoyo + 12, f_max)) if f in puntos
+                         for c, r, t in ((CADERA_I, RODILLA_I, TOBILLO_I), (CADERA_D, RODILLA_D, TOBILLO_D))]
+        escala = 0.491 * estatura_m / np.median(largos_pierna) if largos_pierna else 0.002
+
+        ref_cam = camara_raw.get(FRAME_DESPEGUE, np.zeros(2)).copy()
+        camara = {f: v - ref_cam for f, v in camara_raw.items()}
+        ultimo = max(camara) if camara else f_max
+
+        def pie_bajo(f):
+            return puntos[f][PIES, 1].max() - camara.get(f, np.zeros(2))[1]
+        y_suelo = np.median([pie_bajo(f) for f in range(max(f_min, FRAME_DESPEGUE - 7), FRAME_DESPEGUE + 1) if f in camara and f in puntos])
+
+        cadera = {f: (puntos[f][CADERA_I] + puntos[f][CADERA_D]) / 2 for f in camara if f in puntos}
+        mundo = {f: cadera[f] - camara[f] for f in cadera}
+        sentido = 1 if np.mean([puntos[f][NARIZ][0] - cadera[f][0] for f in range(frame_apoyo, min(FRAME_DESPEGUE + 1, f_max)) if f in puntos]) >= 0 else -1
+
+        idx_vuelo_ini = FRAME_DESPEGUE + int((FRAME_ATERRIZAJE - FRAME_DESPEGUE) * 0.2)
+        idx_vuelo_fin = FRAME_ATERRIZAJE - int((FRAME_ATERRIZAJE - FRAME_DESPEGUE) * 0.2)
+        ks_puro = np.arange(idx_vuelo_ini, idx_vuelo_fin + 1)
+        if len(ks_puro) < 3:
+            ks_puro = np.arange(FRAME_DESPEGUE, FRAME_ATERRIZAJE + 1)
+
+        ks_todos = np.arange(FRAME_DESPEGUE, min(FRAME_ATERRIZAJE + 1, ultimo + 1))
+
+        # Solo se usan los frames donde la IA sí detectó al atleta (así los tiempos y las posiciones
+        # siempre tienen el mismo largo, aunque falten algunos frames en medio del vuelo)
+        ks_todos = np.array([f for f in ks_todos if f in mundo])
+        ks_puro = np.array([f for f in ks_puro if f in mundo])
+        if len(ks_puro) == 0:
+            ks_puro = ks_todos
+        if len(ks_todos) > 1:
+            t_todos = np.array([t_de(f) - t_de(FRAME_DESPEGUE) for f in ks_todos])
+            W_todos = np.array([mundo[f] for f in ks_todos if f in mundo])
+            x_m = (W_todos[:, 0] - W_todos[0, 0]) * sentido * escala
+            y_m = -(W_todos[:, 1] - W_todos[0, 1]) * escala
+
+            t_puro = np.array([t_de(f) - t_de(FRAME_DESPEGUE) for f in ks_puro])
+            W_puro = np.array([mundo[f] for f in ks_puro if f in mundo])
+            x_puro = (W_puro[:, 0] - W_puro[0, 0]) * sentido * escala
+            y_puro = -(W_puro[:, 1] - W_puro[0, 1]) * escala
+
+            vx_m = np.polyfit(t_todos, x_m, 1)[0]
+            a2, vy_m, _ = np.polyfit(t_puro, y_puro, 2) if len(t_puro) > 2 else np.polyfit(t_todos, y_m, 2)
+            v0 = float(np.hypot(vx_m, vy_m))
+            ang_salida = float(np.degrees(np.arctan2(vy_m, vx_m)))
+        else:
+            v0, ang_salida, a2, x_m, y_m = 0.0, 0.0, 0.0, np.array([0]), np.array([0])
+
+        t_vuelo = max(0.0, t_de(FRAME_ATERRIZAJE) - t_de(FRAME_DESPEGUE))
+        t_contacto = max(0.0, (t_de(FRAME_DESPEGUE) - t_de(frame_apoyo)) * 1000)
+
+        umbral_px = 0.10 * estatura_m / escala
+        pts_limpios, picos_corregidos = quitar_picos(puntos, f_min, f_max, umbral_px)
+
+        # MÁXIMA FLEXIÓN DE RODILLA (curva suavizada para que el mínimo no 'salte' entre frames)
+        flexion_max_rodilla, frame_max_flexion, frames_batida, ang_crudo, ang_suave = flexion_maxima_rodilla(
+            pts_limpios, frame_apoyo, FRAME_DESPEGUE, CAD_AP, ROD_AP, TOB_AP)
+
+        extension_despegue = angulo(pts_limpios[FRAME_DESPEGUE][CAD_AP], pts_limpios[FRAME_DESPEGUE][ROD_AP], pts_limpios[FRAME_DESPEGUE][TOB_AP]) if FRAME_DESPEGUE in pts_limpios else 0.0
+
+        # ÁNGULO DE ATAQUE DE LA PIERNA EN EL APOYO
+        p_contacto = pts_limpios.get(frame_apoyo, pts_limpios[min(pts_limpios.keys())])
+        dx_p = (p_contacto[CAD_AP][0] - p_contacto[TOB_AP][0]) * sentido
+        dy_p = p_contacto[TOB_AP][1] - p_contacto[CAD_AP][1]
+        angulo_ataque_pierna = float(np.degrees(np.arctan2(dy_p, abs(dx_p))))
+
+        angulo_inter_rodillas, p_ik = None, None     # apagado: ver MOSTRAR_INTER_RODILLAS
+        if MOSTRAR_INTER_RODILLAS:
+            # ÁNGULO INTER-RODILLAS EN EL FRAME DE APOYO (Calculado directamente entre las dos rodillas respecto al punto medio de las caderas)
+            p_cad_centro = (p_contacto[CADERA_I] + p_contacto[CADERA_D]) / 2
+            v_rod_batida = p_contacto[ROD_AP] - p_cad_centro
+            v_rod_libre = p_contacto[ROD_LIBRE] - p_cad_centro
+            cos_ik = np.dot(v_rod_batida, v_rod_libre) / (np.linalg.norm(v_rod_batida) * np.linalg.norm(v_rod_libre) + 1e-6)
+            angulo_inter_rodillas = float(np.degrees(np.arccos(np.clip(cos_ik, -1, 1))))
+
+            # FÓRMULA DE PUNTUACIÓN EXACTA SOLICITADA
+            score_ik = max(1.0, 100.0 - abs(angulo_inter_rodillas - 31.0) / 0.15)
+            p_ik = int(np.clip(round(score_ik), 1, 100))
+            if 25 <= angulo_inter_rodillas <= 38:
+                col_ik, em_ik, est_ik = "#28a745", "🟢", "Óptimo (Élite)"
+            elif 18 <= angulo_inter_rodillas <= 24 or 39 <= angulo_inter_rodillas <= 46:
+                col_ik, em_ik, est_ik = "#ffc107", "🟡", "Aceptable"
+            else:
+                col_ik, em_ik, est_ik = "#dc3545", "🔴", "Crítico / Defectuoso"
+
+        frames_prev = [f for f in range(max(min(mundo), frame_apoyo - 25), frame_apoyo - 5) if f in mundo]
+        descenso_cm_val = (mundo[frame_apoyo][1] - min(mundo[f][1] for f in frames_prev)) * escala * 100 if frames_prev and frame_apoyo in mundo else None
+
+        # --- CONFIANZA DE LOS DATOS ---
+        rango_critico_c = list(range(max(f_min, frame_apoyo - 10), min(f_max, FRAME_ATERRIZAJE + 5) + 1))
+        cobertura_c = (sum(1 for f in rango_critico_c if f in puntos) / len(rango_critico_c) * 100.0) if rango_critico_c else 0.0
+        alts_px = [puntos[f][PIES, 1].max() - puntos[f][NARIZ, 1] for f in range(frame_apoyo, min(FRAME_ATERRIZAJE, f_max) + 1) if f in puntos]
+        altura_px_c = float(np.median(alts_px)) if len(alts_px) >= 3 else None
+        confianza = evaluar_confianza({
+            "info_tiempos": ds.get("info_tiempos"),
+            "cobertura_pct": cobertura_c,
+            "altura_rel": (altura_px_c / alto_v) if altura_px_c else None,
+            "v0": v0, "ang_salida": ang_salida, "t_vuelo": t_vuelo, "t_contacto": t_contacto,
+            "avance": float(x_m[-1]) if len(x_m) > 1 else None,
+            "errores_piernas": [f for f in sorted(set(ds.get("frames_corregidos", [])) | set(ds.get("frames_interpolados", []))) if frame_apoyo - 1 <= f <= FRAME_DESPEGUE + 1],
+            "pierna_apoyada": pierna_apoyada_en_batida(puntos, frame_apoyo, FRAME_DESPEGUE, altura_px_c) if altura_px_c else None,
+            "pierna_seleccionada": pierna_batida,
+            "gravedad": float(-2 * a2),
+            "cv_pierna": (np.std(largos_pierna) / np.mean(largos_pierna) * 100.0) if len(largos_pierna) > 2 else None,
+            "aviso_tracking": bool(ds.get("aviso_tracking")),
+            "identidad": ds.get("identidad"),
+            "fallos_camara_pct": ds.get("fallos_camara_pct"),
+        })
+        imposibles = confianza["imposibles"]
+
+        # --- ENCABEZADO ---
+        st.success(f"✅ **Análisis completado** · Batida: **{pierna_batida}** · Apoyo: **f.{frame_apoyo}** | Despegue: **f.{FRAME_DESPEGUE}** | Aterrizaje: **f.{FRAME_ATERRIZAJE}**")
+
+        malos = [(t, d) for e, t, d in confianza["checks"] if e == "malo"]
+        avisos = [(t, d) for e, t, d in confianza["checks"] if e == "aviso"]
+        if confianza["bloquea_todo"]:
+            st.error("🔴 **Confianza BAJA: no te fíes de estos datos.**\n\n" + "\n".join(f"- **{t}:** {d}" for t, d in malos))
+        elif confianza["bloquea_angulos"]:
+            st.error("🔴 **Los ángulos de pierna no son fiables.** La velocidad, el ángulo de salida y los tiempos sí pasaron los chequeos.\n\n" + "\n".join(f"- **{t}:** {d}" for t, d in malos))
+        elif confianza["nivel"] == "media":
+            st.warning("🟡 **Confianza MEDIA.**\n\n" + "\n".join(f"- **{t}:** {d}" for t, d in avisos))
+        else:
+            st.success("🟢 **Confianza ALTA** en los datos de este video.")
+
+        with st.expander("🧪 Datos de depuración (para desarrollo)", expanded=False):
+            st.caption("Descarga este archivo para poder probar mejoras con tu video real sin volver a subirlo.")
+            _resultados = {
+                "v0": float(v0), "ang_salida": float(ang_salida), "t_vuelo": float(t_vuelo), "t_contacto": float(t_contacto),
+                "flexion_max_rodilla": float(flexion_max_rodilla), "frame_max_flexion": int(frame_max_flexion),
+                "extension_despegue": float(extension_despegue), "angulo_ataque_pierna": float(angulo_ataque_pierna),
+                "descenso_cm": None if descenso_cm_val is None else float(descenso_cm_val),
+                "confianza": confianza["nivel"], "chequeos": [list(c) for c in confianza["checks"]],
+            }
+            _fases = {"apoyo": int(frame_apoyo), "despegue": int(FRAME_DESPEGUE), "aterrizaje": int(FRAME_ATERRIZAJE), "pierna": pierna_batida}
+            _nombre = os.path.splitext(st.session_state.video_id or "salto")[0]
+            st.download_button("⬇️ Descargar datos de depuración (.json)",
+                               armar_datos_depuracion(ds, st.session_state.video_id, estatura_m, _fases, _resultados),
+                               file_name=f"{_nombre}_depuracion.json", mime="application/json")
+
+        mostrar_datos = True
+        mostrar_angulos = True
+        if confianza["bloquea_todo"]:
+            mostrar_datos = st.checkbox("Mostrar los datos de todos modos (pueden estar equivocados)", value=False)
+            mostrar_angulos = mostrar_datos
+        elif confianza["bloquea_angulos"]:
+            mostrar_angulos = st.checkbox("Mostrar los ángulos de pierna de todos modos (pueden estar equivocados)", value=False)
+
+        if mostrar_angulos:
+            st.markdown(html_resumen_mejoras(
+                armar_resumen_mejoras({"flexion": flexion_max_rodilla, "extension": extension_despegue,
+                                       "ataque": angulo_ataque_pierna, "descenso": descenso_cm_val}),
+                confianza["nivel"], forzado=bool(confianza["bloquea_todo"] or confianza["bloquea_angulos"])),
+                unsafe_allow_html=True)
+
+        if mostrar_datos:
+            c1, c2, c3, c4 = st.columns(4)
+            if "velocidad" in imposibles:
+                c1.metric("Velocidad de Salida", "No fiable")
+            else:
+                c1.metric("Velocidad de Salida", f"{v0:.2f} m/s", f"{v0 * 3.6:.1f} km/h")
+            c2.metric("Ángulo de Salida", "No fiable" if "angulo" in imposibles else f"{ang_salida:.1f}°")
+            c3.metric("Tiempo de Contacto", "No fiable" if "contacto" in imposibles else f"{t_contacto:.0f} ms")
+            if "avance" in imposibles or "vuelo" in imposibles:
+                c4.metric("Avance en Vuelo", "No fiable")
+            else:
+                c4.metric("Avance en Vuelo", f"{x_m[-1]:.2f} m" if len(x_m) > 0 else "0 m", f"Vuelo: {t_vuelo:.2f} s")
+        else:
+            st.caption("Los datos del salto están ocultos porque la confianza es baja. Marca la casilla de arriba para verlos de todos modos.")
+        if mostrar_datos and not mostrar_angulos:
+            st.caption("El diagnóstico técnico (ángulos de pierna) está oculto porque no es fiable. Marca la casilla de arriba para verlo de todos modos.")
+
+        # =====================================================================
+        # DIAGNÓSTICO TÉCNICO
+        # =====================================================================
+        if mostrar_angulos:
+            st.subheader("📋 Diagnóstico Técnico según Criterios del Entrenador")
+
+            p_flex, col_flex, em_flex, est_flex = puntaje_parametro("flexion", flexion_max_rodilla)
+            p_ext, col_ext, em_ext, est_ext = puntaje_parametro("extension", extension_despegue)
+            p_ataq, col_ataq, em_ataq, est_ataq = puntaje_parametro("ataque", angulo_ataque_pierna)
+            p_desc, col_desc, em_desc, est_desc = puntaje_parametro("descenso", descenso_cm_val)
+
+            # el descenso es orientativo (medición ruidosa): se muestra, pero no cuenta en el puntaje global
+            puntaje_global, col_glob, em_glob, est_glob = puntaje_global_tecnico([p_flex, p_ext, p_ataq, p_ik])
+
+            st.markdown(f"""
+            <div style="background-color: {col_glob}18; border: 1px solid {col_glob}; border-radius: 10px; padding: 12px 18px; margin-bottom: 16px; display: flex; align-items: center; justify-content: space-between;">
+                <span style="font-size: 1.05rem; font-weight: 600;">{em_glob} Puntaje Técnico Global del Salto</span>
+                <span style="font-size: 1.3rem; font-weight: 800; color: {col_glob};">{puntaje_global} / 100 — {est_glob}</span>
+            </div>
+            """, unsafe_allow_html=True)
+
+            if MOSTRAR_INTER_RODILLAS:
+                e1, e2, e3, e4, e5 = st.columns(5)
+            else:
+                e1, e2, e3, e5 = st.columns(4)
+            with e1:
+                renderizar_tarjeta_semaforo("Máx. Flexión Rodilla", f"{flexion_max_rodilla:.1f}° (f.{frame_max_flexion})", "Meta ideal: 140° – 155°", p_flex, col_flex, em_flex, est_flex)
+            with e2:
+                renderizar_tarjeta_semaforo("Extensión Despegue", f"{extension_despegue:.1f}° (f.{FRAME_DESPEGUE})", "Meta ideal: ~170°+", p_ext, col_ext, em_ext, est_ext)
+            with e3:
+                renderizar_tarjeta_semaforo("Ángulo Ataque Pierna", f"{angulo_ataque_pierna:.1f}° (f.{frame_apoyo})", "Meta ideal: 55° – 65°", p_ataq, col_ataq, em_ataq, est_ataq)
+            if MOSTRAR_INTER_RODILLAS:
+                with e4:
+                    renderizar_tarjeta_semaforo("Ángulo Inter-rodillas", f"{angulo_inter_rodillas:.1f}° (f.{frame_apoyo})", "Meta ideal: 25° – 38°", p_ik, col_ik, em_ik, est_ik)
+            with e5:
+                val_desc_txt = f"{descenso_cm_val:.1f} cm" if descenso_cm_val is not None else "N/D"
+                renderizar_tarjeta_semaforo("Descenso CM (orientativo)", val_desc_txt, "Meta ideal: 7.0 – 8.0 cm · medición ±1 cm", p_desc, col_desc, em_desc, est_desc)
+
+            with st.expander("🔍 Depuración: ángulo de rodilla frame a frame", expanded=False):
+                st.dataframe({"frame": frames_batida,
+                              "ángulo crudo (°)": np.round(ang_crudo, 1),
+                              "ángulo suavizado (°)": np.round(ang_suave, 1)}, use_container_width=True)
+                st.line_chart({"crudo": ang_crudo, "suavizado": ang_suave})
+
+        # =====================================================================
+        # AUDITORÍA DE FIABILIDAD
+        # =====================================================================
+        st.divider()
+        st.subheader("🛡️ Fiabilidad y Calidad de los Datos Medidos")
+
+        grav_est = float(-2 * a2)
+        p_grav, col_grav, em_grav, est_grav = calcular_puntaje_semaforo(grav_est, 8.5, 11.0, tolerancia=4.0)
+
+        rango_critico = list(range(max(f_min, frame_apoyo - 10), min(f_max, FRAME_ATERRIZAJE + 5) + 1))
+        frames_detectados_criticos = sum(1 for f in rango_critico if f in puntos)
+        cobertura_pct = (frames_detectados_criticos / len(rango_critico) * 100.0) if rango_critico else 0.0
+        p_track, col_track, em_track, est_track = calcular_puntaje_semaforo(cobertura_pct, 95.0, 100.0, tolerancia=25.0)
+
+        cv_pierna = (np.std(largos_pierna) / np.mean(largos_pierna) * 100.0) if len(largos_pierna) > 2 else 15.0
+        p_escala, col_escala, em_escala, est_escala = calcular_puntaje_semaforo(cv_pierna, 0.0, 5.0, tolerancia=10.0)
+
+        fiabilidad_global = int(round(np.mean([p_grav, p_track, p_escala])))
+        if fiabilidad_global >= 80:
+            col_fia, em_fia, est_fia = "#28a745", "🟢", "Datos Altamente Confiables"
+        elif fiabilidad_global >= 50:
+            col_fia, em_fia, est_fia = "#ffc107", "🟡", "Fiabilidad Moderada"
+        else:
+            col_fia, em_fia, est_fia = "#dc3545", "🔴", "Baja Fiabilidad"
+
+        st.markdown(f"""
+        <div style="background-color: {col_fia}18; border: 1px solid {col_fia}; border-radius: 10px; padding: 10px 18px; margin-bottom: 14px; display: flex; align-items: center; justify-content: space-between;">
+            <span style="font-size: 1.0rem; font-weight: 600;">{em_fia} Índice Global de Fiabilidad de Medición</span>
+            <span style="font-size: 1.25rem; font-weight: 800; color: {col_fia};">{fiabilidad_global} / 100 — {est_fia}</span>
+        </div>
+        """, unsafe_allow_html=True)
+
+        f1, f2, f3 = st.columns(3)
+        with f1:
+            renderizar_tarjeta_semaforo("Validación Física (Gravedad)", f"{grav_est:.2f} m/s²", "Ideal terrestre: 9.81 m/s² (8.5–11.0)", p_grav, col_grav, em_grav, est_grav)
+        with f2:
+            renderizar_tarjeta_semaforo("Estabilidad Tracking IA", f"{cobertura_pct:.0f}%", f"Picos corregidos: {picos_corregidos} · Ideal ≥ 95%", p_track, col_track, em_track, est_track)
+        with f3:
+            renderizar_tarjeta_semaforo("Consistencia de Perspectiva", f"±{cv_pierna:.1f}% var.", "Variación ósea · Ideal < 5.0%", p_escala, col_escala, em_escala, est_escala)
+
+        st.markdown("**Chequeos automáticos de confianza**")
+        iconos = {"ok": "🟢", "aviso": "🟡", "malo": "🔴"}
+        for estado, titulo, detalle in confianza["checks"]:
+            st.markdown(f"{iconos[estado]} **{titulo}** — {detalle}")
+
+        # =====================================================================
+        # VIDEO Y GRÁFICOS
+        # =====================================================================
+        st.divider()
+        with st.spinner("Generando video completo anotado..."):
+            temp_raw = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4").name
+            final_mp4 = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4").name
+
+            cap = cv2.VideoCapture(ruta_video)
+            ESCALA_V = 0.5
+            tam_s = (int(ancho_v * ESCALA_V), int(alto_v * ESCALA_V))
+            salida = cv2.VideoWriter(temp_raw, cv2.VideoWriter_fourcc(*"mp4v"), fps * velocidad_video, tam_s)
+
+            grosor = max(3, ancho_v // 150)
+            fuente_g = cargar_fuente(int(ancho_v / 18))
+            fuente_p = cargar_fuente(int(ancho_v / 25))
+            HOM_AP = HOMBRO_D if pierna_batida == "Derecha" else HOMBRO_I
+
+            f_actual = 0
+            while True:
+                ok, img = cap.read()
+                if not ok:
+                    break
+
+                if f_actual in pts_limpios:
+                    p = pts_limpios[f_actual]
+                    for conexiones, color in ((CUERPO, VERDE), (PIERNA_LIBRE, NARANJA), (PIERNA_APOYO, AZUL)):
+                        for a, b in conexiones:
+                            cv2.line(img, tuple(p[a].astype(int)), tuple(p[b].astype(int)), color, grosor, cv2.LINE_AA)
+
+                    hombros, caderas = (p[11] + p[12]) / 2, (p[23] + p[24]) / 2
+                    inc_tronco = inclinacion(caderas, hombros, sentido)
+                    ang_cadera = angulo(p[HOM_AP], p[CAD_AP], p[ROD_AP])
+                    ang_rodilla = angulo(p[CAD_AP], p[ROD_AP], p[TOB_AP])
+
+                    base = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB)).convert("RGBA")
+                    capa = Image.new("RGBA", base.size, (0, 0, 0, 0))
+                    d = ImageDraw.Draw(capa)
+                    etiquetas_apiladas_fijas(d, [(hombros, f"TRONCO {round(inc_tronco)}°"),
+                                                 (p[CAD_AP], f"CADERA {round(ang_cadera)}°"),
+                                                 (p[ROD_AP], f"RODILLA {round(ang_rodilla)}°")], fuente_p, ancho_v, sentido)
+                else:
+                    base = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB)).convert("RGBA")
+                    capa = Image.new("RGBA", base.size, (0, 0, 0, 0))
+                    d = ImageDraw.Draw(capa)
+
+                if f_actual < frame_apoyo:
+                    fase_txt = "Aproximación"
+                elif f_actual < FRAME_DESPEGUE:
+                    fase_txt = "Apoyo → Despegue"
+                elif f_actual <= FRAME_ATERRIZAJE:
+                    fase_txt = "Vuelo"
+                else:
+                    fase_txt = "Aterrizaje"
+
+                y_hud = int(ancho_v * 0.03)
+                for texto, fuente in ((fase_txt, fuente_g),
+                                      (f"FRAME {f_actual}   t = {(t_de(f_actual) - t_de(FRAME_DESPEGUE)) * 1000:+.0f} ms", fuente_p),
+                                      ("Vuelo: no fiable" if "vuelo" in imposibles else f"Vuelo {t_vuelo:.2f} s", fuente_p),
+                                      ("Salida: no fiable" if ({"velocidad", "angulo"} & imposibles) else f"Salida {v0:.1f} m/s · {ang_salida:.0f}°", fuente_p)):
+                    pastilla(d, int(ancho_v * 0.03), y_hud, texto, fuente)
+                    y_hud += medir(d, texto, fuente)[1] + int(ancho_v * 0.012)
+
+                img = cv2.cvtColor(np.array(Image.alpha_composite(base, capa).convert("RGB")), cv2.COLOR_RGB2BGR)
+                salida.write(cv2.resize(img, tam_s))
+                f_actual += 1
+
+            cap.release()
+            salida.release()
+            subprocess.run([
+                "ffmpeg", "-y", "-loglevel", "error", "-i", temp_raw,
+                "-vcodec", "libx264", "-pix_fmt", "yuv420p", "-movflags", "+faststart", final_mp4
+            ], check=True)
+
+        with open(final_mp4, "rb") as f_vid:
+            video_bytes = f_vid.read()
+
+        col_vid, col_graf = st.columns([1, 1.2])
+
+        with col_vid:
+            st.subheader("🎬 Video Anotado Completo")
+            st.video(video_bytes)
+            st.download_button("⬇️ Descargar Video Completo Analizado", video_bytes, file_name="salto_analizado_completo.mp4", mime="video/mp4")
+
+        with col_graf:
+            st.subheader("📈 Validación Física y Detección de Fases")
+            fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(7, 7))
+
+            ax1.plot(x_m, y_m, "-o", color="tab:blue", label="Trayectoria real del CM")
+            ax1.set_xlabel("Avance (m)")
+            ax1.set_ylabel("Altura (m)")
+            ax1.set_title(f"Parábola de Vuelo (Gravedad estimada: {grav_est:.1f} m/s² | Ref: 9.8 m/s²)")
+            ax1.grid(alpha=0.3)
+            ax1.legend()
+
+            ks_pie = sorted(f for f in camara.keys() if f in puntos)
+            altura_cm = [(y_suelo - pie_bajo(f)) * escala * 100 for f in ks_pie if f in puntos]
+            ax2.plot(ks_pie[:len(altura_cm)], altura_cm, "-o", ms=3, color="tab:orange", label="Altura del pie")
+            ax2.axhline(0, color="gray")
+            ax2.axvline(frame_apoyo, color="blue", ls="--", label=f"Apoyo (f.{frame_apoyo})")
+            ax2.axvline(FRAME_DESPEGUE, color="purple", ls="--", label=f"Despegue (f.{FRAME_DESPEGUE})")
+            ax2.axvline(FRAME_ATERRIZAJE, color="green", ls="--", label=f"Aterrizaje (f.{FRAME_ATERRIZAJE})")
+            ax2.set_xlabel("Frame")
+            ax2.set_ylabel("Altura del pie (cm)")
+            ax2.set_title("Control de Fases Detectadas")
+            ax2.grid(alpha=0.3)
+            ax2.legend()
+
+            plt.tight_layout()
+            st.pyplot(fig)
